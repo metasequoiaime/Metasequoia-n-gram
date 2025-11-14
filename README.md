@@ -30,6 +30,16 @@ This project includes 4 parts:
   - 按单字切分的 2-gram 数据。
   - 按词切分的 tokens 的 2-gram 数据。
 
+## How to build and run
+
+For windows, you can use pwsh7 like this:
+
+```shell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
 ## Reference
 
 - open-gram: <https://github.com/sunpinyin/open-gram>
