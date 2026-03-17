@@ -1,4 +1,4 @@
-# metasequoia-gram
+# Metasequoia n-gram
 
 Metasequoia-gram is a project tries to collect lexicon and build n-gram dataset for IME(Input Method Editor) in Chinese.
 
