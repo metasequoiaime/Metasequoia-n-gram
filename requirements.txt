@@ -1,1 +1,3 @@
-hanlp==2.1.3
+regex
+kenlm
+opencc

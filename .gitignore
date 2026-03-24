@@ -6,4 +6,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-data/
+data/*
+!data/.gitkeep
+kenlm_bin/*
+!kenlm_bin/.gitkeep
+model/*
+!model/.gitkeep
+tmp/*
