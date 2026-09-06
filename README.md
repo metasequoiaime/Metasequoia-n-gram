@@ -1,5 +1,12 @@
 # Metasequoia n-gram
 
+<!-- badges:start -->
+[![CI](https://img.shields.io/github/actions/workflow/status/metasequoiaime/Metasequoia-n-gram/ci.yml?branch=main&label=CI)](https://github.com/metasequoiaime/Metasequoia-n-gram/actions/workflows/ci.yml)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/metasequoiaime/Metasequoia-n-gram/codeql.yml?branch=main&label=CodeQL)](https://github.com/metasequoiaime/Metasequoia-n-gram/actions/workflows/codeql.yml)
+[![License](https://img.shields.io/github/license/metasequoiaime/Metasequoia-n-gram)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/metasequoiaime/Metasequoia-n-gram?style=flat)](https://github.com/metasequoiaime/Metasequoia-n-gram/stargazers)
+<!-- badges:end -->
+
 Metasequoia-gram is a project tries to collect lexicon and build n-gram dataset for IME(Input Method Editor) in Chinese.
 
 This project includes 4 parts:
@@ -8,6 +15,25 @@ This project includes 4 parts:
 - data preprocessing
 - segmentation
 - n-gram info counting
+
+## Corpus provenance and licensing
+
+This repository distributes **processing scripts only**. No corpus and no trained model is committed: `data/`, `model/` and `kenlm_bin/` are gitignored down to their `.gitkeep`, and nothing under them is tracked. You supply the corpus yourself.
+
+That matters because the corpus this project was built against is not freely relicensable, and the licence on the repository you download it from does not settle the question:
+
+- The upstream aggregator, [brightmart/nlp_chinese_corpus](https://github.com/brightmart/nlp_chinese_corpus), is published under MIT. That covers the aggregator's own work, not the third-party text it packages.
+- `wiki2019zh` is derived from Chinese Wikipedia, which is **CC BY-SA 3.0**. That licence carries an attribution requirement and is share-alike: anything substantially derived from it inherits those terms.
+- `news2016zh` is scraped news articles and `baike2018qa` is Baidu Baike content. Neither carries a licence that permits redistribution.
+
+Nobody downstream of Wikipedia can relicense Wikipedia's text under MIT, so treat the aggregator's MIT badge as covering its scripts and packaging only.
+
+**What this means in practice.** Statistics computed from a corpus (n-gram counts, probabilities) are generally not the corpus, and the boundary between "statistics" and "a derivative work" is not sharp — a model that can reproduce source sentences is much closer to a derivative than a table of bigram frequencies. So:
+
+- Nothing produced here has entered the shipped product. There is currently no n-gram or KenLM model in [MSIME-Engine](https://github.com/metasequoiaime/MSIME-Engine) and no code path that loads one.
+- **Before any model built from this pipeline ships inside the input method**, the licensing of the specific subsets used has to be settled first: either restrict training to subsets that are cleanly licensed for redistribution, or satisfy CC BY-SA attribution and share-alike for the Wikipedia-derived portion, and record the outcome in the Engine's `NOTICE.md` alongside the other dictionary sources.
+
+The `LICENSE` in this repository (GPL-3.0) applies to the scripts here. It says nothing about, and cannot grant any rights to, the corpus you feed them.
 
 ## Corpus collection
 
@@ -98,3 +124,11 @@ python .\test\viterbi_no_pruning.py
 
 - open-gram: <https://github.com/sunpinyin/open-gram>
 - nlp_chinese_corpus: <https://github.com/brightmart/nlp_chinese_corpus>
+
+<!-- star-history:start -->
+## Star History
+
+<a href="https://star-history.com/#metasequoiaime/Metasequoia-n-gram&Date">
+  <img src="https://api.star-history.com/svg?repos=metasequoiaime/Metasequoia-n-gram&type=Date" alt="Star History Chart" width="600">
+</a>
+<!-- star-history:end -->
