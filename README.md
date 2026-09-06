@@ -18,10 +18,10 @@ This project includes 4 parts:
 对于句子中的非中文字符，进行过滤，只要是非中文的字符，一律将其扩充成连通块，然后，将这个连通块当作是一个分隔符，将句子切分成小句子。最后，预处理好的数据就都是一个个由纯粹的中文组成的单独的连通块。
 
 ```powershell
-python .\preprocessing\generated_cleaned_txt\extract_connected_hanzi_components.py
-python .\processing\generated_cleaned_txt\extract_wiki_connected_hanzi_components.py
-python .\processing\generated_cleaned_txt\split_all_cleaned_txt_using_space.py
-python .\processing\generated_cleaned_txt\split_wiki_txt_using_space.py
+python .\preprocessing\generate_cleaned_txt\extract_connected_hanzi_components.py
+python .\preprocessing\generate_cleaned_txt\extract_wiki_connected_hanzi_components.py
+python .\preprocessing\generate_cleaned_txt\split_all_cleaned_txt_using_space.py
+python .\preprocessing\generate_cleaned_txt\split_wiki_txt_using_space.py
 ```
 
 注意，这里是比较耗时的，至少需要半个小时左右，在我的 11 代 intel 处理器上。
@@ -85,7 +85,7 @@ pip install opencc
 跑测试代码之前，需要先生成一下拼音到单个汉字的候选项列表的字典文件，
 
 ```powershell
-python .\preprocessing\generated_single_hanzi_pinyin_tbl\make_single_pinyin_table.py
+python .\preprocessing\generate_single_hanzi_pinyin_tbl\make_single_pinyin_table.py
 ```
 
 然后，就可以运行测试了，

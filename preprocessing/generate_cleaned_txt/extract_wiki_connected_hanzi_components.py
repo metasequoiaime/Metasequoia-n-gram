@@ -43,7 +43,7 @@ def iter_input_files(data_dir):
 
 
 def main():
-    base_dir = os.path.dirname(os.path.dirname(__file__))
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     data_dir = os.path.join(base_dir, "data")
     output_file = os.path.join(base_dir, "data/output/all_cleaned_only_wiki_zh.txt")
 
