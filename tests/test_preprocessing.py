@@ -1,6 +1,9 @@
 """Exercise actual preprocessing functions without downloading a private/large corpus."""
 import importlib.util
 import io
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -31,6 +34,35 @@ class PreprocessingTests(unittest.TestCase):
             self.assertEqual(module.split_hanzi_with_space(" 水杉输入法\n"), "水 杉 输 入 法")
             self.assertEqual(module.split_hanzi_with_space("𠀀中文"), "𠀀 中 文")
             self.assertEqual(module.split_hanzi_with_space("\n"), "")
+
+    def test_command_line_pipeline_uses_repository_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "checkout"
+            scripts = checkout / "preprocessing/generate_cleaned_txt"
+            shutil.copytree(SOURCE, scripts)
+            data = checkout / "data"
+            (data / "wiki_zh").mkdir(parents=True)
+            (data / "wiki_zh/article.json").write_text('{"text": "水杉输入法123。"}\n', encoding="utf-8")
+            (data / "news_train.json").write_text('{"text": "合成语料。"}\n', encoding="utf-8")
+            for script in (
+                "extract_connected_hanzi_components.py",
+                "extract_wiki_connected_hanzi_components.py",
+                "split_all_cleaned_txt_using_space.py",
+                "split_wiki_txt_using_space.py",
+            ):
+                result = subprocess.run([sys.executable, str(scripts / script)],
+                                        cwd=directory, capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            expected = {
+                "all_cleaned.txt": "水杉输入法\n合成语料\n",
+                "all_cleaned_only_wiki_zh.txt": "水杉输入法\n",
+                "all_cleaned_spaced.txt": "水 杉 输 入 法\n合 成 语 料\n",
+                "all_cleaned_only_wiki_zh_spaced.txt": "水 杉 输 入 法\n",
+            }
+            for filename, content in expected.items():
+                output = data / "output" / filename
+                self.assertTrue(output.is_file(), f"Pipeline did not create {output}")
+                self.assertEqual(output.read_text(encoding="utf-8"), content)
 
     def test_corpus_selection(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -11,7 +11,7 @@ def split_hanzi_with_space(line: str) -> str:
 
 
 def main():
-    base_dir = os.path.dirname(os.path.dirname(__file__))
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     input_path = os.path.join(base_dir, "data/output/all_cleaned_only_wiki_zh.txt")
     output_path = os.path.join(
         base_dir, "data/output/all_cleaned_only_wiki_zh_spaced.txt"
