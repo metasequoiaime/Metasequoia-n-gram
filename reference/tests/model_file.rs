@@ -451,3 +451,47 @@ fn resumed_scores_match_scoring_from_nothing() {
         }
     }
 }
+
+/// 完全复用、部分续跑与上下文失效都必须保留冷计算的评分与首选。
+#[test]
+fn cached_sequences_match_fresh_scores() {
+    for precision in ["f32", "f16", "int8"] {
+        let model =
+            std::sync::Arc::new(SentenceModel::load(&complete(precision).finish()).unwrap());
+        let mut reranker = Reranker::new(model.clone());
+        let rounds: &[(&str, &[&str])] = &[
+            ("我", &["你好", "你吗"]),
+            ("我", &["你吗", "你好", "你好"]),
+            ("我", &["你好吗", "你很", "你"]),
+            ("我", &["你", "你好吗", "我很好", ""]),
+            ("很", &["你", "你好吗", "我很好", ""]),
+            ("我很好我很好我很好", &["你好", "你吗"]),
+            ("吗我很好我很好我很好", &["你吗", "你好"]),
+            ("", &["你好你好你好你好我", "你好你好你好你好吗"]),
+            ("", &["你好你好你好你好吗", "你好你好你好你好我"]),
+            ("", &["", ""]),
+            ("", &[]),
+            ("", &["你好", "你吗", "🙂", "A"]),
+        ];
+        for &(context, texts) in rounds {
+            let warm = reranker.log_probabilities(context, texts);
+            let fresh = Reranker::new(model.clone()).log_probabilities(context, texts);
+            for (left, right) in warm.iter().zip(&fresh) {
+                assert!(
+                    left == right || (left - right).abs() < 1e-4,
+                    "{precision}: warm {left}, fresh {right}"
+                );
+            }
+            let best = |scores: &[f32]| {
+                scores
+                    .iter()
+                    .enumerate()
+                    .fold(None, |best: Option<usize>, (index, score)| match best {
+                        Some(old) if *score <= scores[old] => Some(old),
+                        _ => Some(index),
+                    })
+            };
+            assert_eq!(best(&warm), best(&fresh), "{precision}");
+        }
+    }
+}
