@@ -628,7 +628,7 @@ impl SentenceModel {
                 n_embd,
                 3 * n_embd,
             );
-            let (q, k, v) = split_qkv(&qkv, tokens.len(), n_embd);
+            let (q, k, v) = split_qkv(&qkv, tokens.len(), n_embd, &[], &[]);
             let attended = self.attention(&q, &k, &v, tokens.len(), 0);
             let projected = linear(
                 &attended,
@@ -729,11 +729,13 @@ impl SentenceModel {
                 n_embd,
                 3 * n_embd,
             );
-            let (q, k, v) = split_qkv(&qkv, tokens.len(), n_embd);
-            let mut keys = prefix_keys[layer][..prefix_width].to_vec();
-            let mut values = prefix_values[layer][..prefix_width].to_vec();
-            keys.extend_from_slice(&k);
-            values.extend_from_slice(&v);
+            let (q, keys, values) = split_qkv(
+                &qkv,
+                tokens.len(),
+                n_embd,
+                &prefix_keys[layer][..prefix_width],
+                &prefix_values[layer][..prefix_width],
+            );
             let attended = self.attention(&q, &keys, &values, tokens.len(), length);
             let projected = linear(
                 &attended,
@@ -1214,15 +1216,25 @@ fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], width: usize) -> Vec<f32>
     out
 }
 
-fn split_qkv(qkv: &[f32], rows: usize, n_embd: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let mut q = vec![0.0; rows * n_embd];
-    let mut k = vec![0.0; rows * n_embd];
-    let mut v = vec![0.0; rows * n_embd];
+/// 按最终大小拆分，新增 K、V 直接写入已有可见前缀之后。
+fn split_qkv(
+    qkv: &[f32],
+    rows: usize,
+    n_embd: usize,
+    prefix_keys: &[f32],
+    prefix_values: &[f32],
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let width = rows * n_embd;
+    let mut q = Vec::with_capacity(width);
+    let mut k = Vec::with_capacity(prefix_keys.len() + width);
+    let mut v = Vec::with_capacity(prefix_values.len() + width);
+    k.extend_from_slice(prefix_keys);
+    v.extend_from_slice(prefix_values);
     for row in 0..rows {
         let source = &qkv[row * 3 * n_embd..(row + 1) * 3 * n_embd];
-        q[row * n_embd..(row + 1) * n_embd].copy_from_slice(&source[..n_embd]);
-        k[row * n_embd..(row + 1) * n_embd].copy_from_slice(&source[n_embd..2 * n_embd]);
-        v[row * n_embd..(row + 1) * n_embd].copy_from_slice(&source[2 * n_embd..]);
+        q.extend_from_slice(&source[..n_embd]);
+        k.extend_from_slice(&source[n_embd..2 * n_embd]);
+        v.extend_from_slice(&source[2 * n_embd..]);
     }
     (q, k, v)
 }
@@ -1371,6 +1383,40 @@ mod tests {
         let before = count();
         reranker.log_probabilities("我", &["你很好", "你", "你很好"]);
         assert_eq!(count() - before, 0, "缩短候选不应补算末位置");
+    }
+
+    #[test]
+    fn split_qkv_preserves_prefix_and_row_order() {
+        let qkv = [
+            1.0, -0.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let keys = [21.0, 22.0, 23.0, 24.0];
+        let values = [31.0, 32.0, 33.0, 34.0];
+        let bits = |row: &[f32]| row.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        for (prefix_keys, prefix_values) in [(&[][..], &[][..]), (&keys[..], &values[..])] {
+            let (q, k, v) = super::split_qkv(&qkv, 2, 2, prefix_keys, prefix_values);
+            assert_eq!(bits(&q), bits(&[1.0, -0.0, 7.0, 8.0]));
+            let expected_keys = [prefix_keys, &[3.0, 4.0, 9.0, 10.0]].concat();
+            let expected_values = [prefix_values, &[5.0, 6.0, 11.0, 12.0]].concat();
+            assert_eq!(bits(&k), bits(&expected_keys));
+            assert_eq!(bits(&v), bits(&expected_values));
+            let (q, k, v) = super::split_qkv(&[], 0, 2, prefix_keys, prefix_values);
+            assert!(q.is_empty());
+            assert_eq!(bits(&k), bits(prefix_keys));
+            assert_eq!(bits(&v), bits(prefix_values));
+        }
+    }
+
+    #[test]
+    fn a_short_tail_does_not_double_the_retained_kv_capacity() {
+        let model = cache_test_model();
+        let prefix = model.run_prefix(&[super::BOS, 3, 4, 5, 6]);
+        let states = model.run_tail_states(5, &prefix.keys, &prefix.values, &[3]);
+        let width = 6 * model.config.n_embd;
+        for row in states.keys.iter().chain(&states.values) {
+            assert_eq!(row.len(), width);
+            assert_eq!(row.capacity(), width, "短尾部保留了几何扩容后的 KV 容量");
+        }
     }
 
     #[test]
