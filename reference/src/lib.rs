@@ -901,6 +901,9 @@ pub struct Reranker {
     /// A spare vector whose allocation is reused while the previous decision remains available
     /// for prefix matching.
     resume_scratch: Vec<(Vec<u32>, Arc<TailRun>)>,
+    /// `best_where` only needs scores until it has chosen an index; keep that short result buffer
+    /// between keystrokes instead of allocating it for every decision.
+    scores_scratch: Vec<f32>,
 }
 
 impl Reranker {
@@ -910,6 +913,7 @@ impl Reranker {
             cached: None,
             resume: Vec::new(),
             resume_scratch: Vec::new(),
+            scores_scratch: Vec::new(),
         }
     }
 
@@ -964,14 +968,22 @@ impl Reranker {
         facts: impl Fn(usize) -> CandidateFacts,
     ) -> Option<usize> {
         let considered = comparable(texts.len(), &facts)?;
-        let scores = self.score_indices(context, texts, considered.as_slice().iter().copied());
+        let mut scores = std::mem::take(&mut self.scores_scratch);
+        self.score_indices_into(
+            context,
+            texts,
+            considered.as_slice().iter().copied(),
+            &mut scores,
+        );
         let mut best = 0;
         for (index, score) in scores.iter().enumerate() {
             if *score > scores[best] {
                 best = index;
             }
         }
-        (best != 0).then(|| considered.as_slice()[best])
+        let promoted = (best != 0).then(|| considered.as_slice()[best]);
+        self.scores_scratch = scores;
+        promoted
     }
 
     /// Mean log-probability per character for each candidate, in the order given.
@@ -984,15 +996,18 @@ impl Reranker {
     }
 
     fn score(&mut self, context: &str, candidates: &[&str]) -> Vec<f32> {
-        self.score_indices(context, candidates, 0..candidates.len())
+        let mut scores = Vec::new();
+        self.score_indices_into(context, candidates, 0..candidates.len(), &mut scores);
+        scores
     }
 
-    fn score_indices(
+    fn score_indices_into(
         &mut self,
         context: &str,
         candidates: &[&str],
         indices: impl Iterator<Item = usize> + Clone,
-    ) -> Vec<f32> {
+        scores: &mut Vec<f32>,
+    ) {
         let longest = indices
             .clone()
             .map(|index| candidates[index].chars().count())
@@ -1018,7 +1033,8 @@ impl Reranker {
         if !matched {
             previous.clear();
         }
-        let mut scores = Vec::with_capacity(capacity);
+        scores.clear();
+        scores.reserve(capacity.saturating_sub(scores.capacity()));
         let limit = self
             .model
             .config
@@ -1072,7 +1088,6 @@ impl Reranker {
         }
         previous.clear();
         self.resume_scratch = previous;
-        scores
     }
 }
 
@@ -1424,6 +1439,17 @@ mod tests {
         assert!(reranker.resume_scratch.capacity() >= 2);
         reranker.log_probabilities("我", &["你好很", "你吗很"]);
         assert_eq!(reranker.resume.as_ptr(), spare);
+    }
+
+    #[test]
+    fn best_where_reuses_the_score_buffer_capacity() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        let facts = answering(&[true, true]);
+        reranker.best_where("我", &["你好", "你吗"], &facts);
+        let spare = reranker.scores_scratch.as_ptr();
+        assert!(reranker.scores_scratch.capacity() >= 2);
+        reranker.best_where("我", &["你很", "你我"], &facts);
+        assert_eq!(reranker.scores_scratch.as_ptr(), spare);
     }
 
     #[test]
