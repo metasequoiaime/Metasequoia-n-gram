@@ -231,6 +231,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
+    // 每轮改掉末字，避免完整候选命中掩盖共享前缀续跑的代价。
+    // 两个字必须是不同的已知 token，不能都退化成 UNK 而意外命中完整候选缓存。
+    if model.token('甲').is_none() || model.token('乙').is_none() {
+        return Err("changing-final-character benchmark needs known 甲 and 乙 tokens".into());
+    }
+    println!("\nchanging final character with a warm Reranker, milliseconds (p50 / p95 over {RUNS} runs):");
+    print!("{:>12}", "chars:");
+    for length in LENGTHS {
+        print!("{length:>14}");
+    }
+    println!();
+    for count in COUNTS {
+        print!("{count:>10} cand");
+        for length in LENGTHS {
+            let (texts, _) = candidates(&pool, count, length);
+            let variants: Vec<Vec<String>> = ['甲', '乙']
+                .iter()
+                .map(|last| {
+                    texts
+                        .iter()
+                        .map(|text| {
+                            text.chars()
+                                .take(length - 1)
+                                .chain(std::iter::once(*last))
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<Vec<&str>> = variants
+                .iter()
+                .map(|texts| texts.iter().map(String::as_str).collect())
+                .collect();
+            let mut reranker = Reranker::new(model.clone());
+            reranker.log_probabilities("", &refs[1]);
+            let mut samples = Vec::with_capacity(RUNS);
+            for run in 0..RUNS {
+                let started = Instant::now();
+                let _ = reranker.log_probabilities("", &refs[run % 2]);
+                samples.push(ms(started.elapsed()));
+            }
+            samples.sort_by(|a, b| a.total_cmp(b));
+            print!(
+                "{:>7.3} /{:>6.3}",
+                percentile(&samples, 50.0),
+                percentile(&samples, 95.0)
+            );
+        }
+        println!();
+    }
+
     // What a host actually pays. Typing an n-character sentence does not cost one decision at
     // length n; it costs a decision at every length up to n, because the candidate list is rescored
     // from scratch on each keystroke. That the totals below grow faster than the single-decision row

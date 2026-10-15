@@ -14,8 +14,14 @@
 
 mod weights;
 
+#[cfg(test)]
+thread_local! {
+    // 只统计当前测试线程实际执行的完整词表投影，不改变生产接口。
+    static VOCABULARY_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use weights::{Tensor, Weights};
 
@@ -181,16 +187,29 @@ impl std::fmt::Debug for Reranker {
     }
 }
 
+// 状态只属于生成它的模型；分叉续跑共享归一化常数，不缓存整张词表。
+struct HiddenState {
+    values: Vec<f32>,
+    log_normalizer: OnceLock<f32>,
+}
+
+impl HiddenState {
+    fn new(values: Vec<f32>) -> Self {
+        Self {
+            values,
+            log_normalizer: OnceLock::new(),
+        }
+    }
+}
+
 /// The per-layer keys and values for a prefix, so that scoring several candidates against the same
 /// committed text runs the prefix once instead of once per candidate.
 struct Prefix {
     length: usize,
     keys: Vec<Vec<f32>>,
     values: Vec<Vec<f32>>,
-    /// The normalized hidden state at the last prefix position. Position i predicts token i + 1, so
-    /// this is what predicts a candidate's opening character, and without it that character would
-    /// go unscored while every later one was counted.
-    last_hidden: Vec<f32>,
+    /// 前缀末位置预测候选首字，隐藏状态与它的归一化常数一起共享。
+    last_hidden: Arc<HiddenState>,
 }
 
 /// Everything one candidate's run passed through, so that a later run agreeing with part of it can
@@ -201,8 +220,8 @@ struct TailRun {
     base: usize,
     keys: Vec<Vec<f32>>,
     values: Vec<Vec<f32>>,
-    /// Normalized hidden state after each of this run's positions, which is what predicts the next.
-    hidden: Vec<Vec<f32>>,
+    /// 每个位置预测下一字的隐藏状态；共享续跑时保留已计算的归一化常数。
+    hidden: Vec<Arc<HiddenState>>,
     /// Log-probability of the run's first `i + 1` tokens, summed left to right.
     cumulative: Vec<f32>,
 }
@@ -509,7 +528,12 @@ impl SentenceModel {
             values.push(v);
         }
         let last = (tokens.len() - 1) * n_embd;
-        let last_hidden = layer_norm(&x[last..], &self.final_weight, &self.final_bias, n_embd);
+        let last_hidden = Arc::new(HiddenState::new(layer_norm(
+            &x[last..],
+            &self.final_weight,
+            &self.final_bias,
+            n_embd,
+        )));
         Prefix {
             length: tokens.len(),
             keys,
@@ -588,7 +612,9 @@ impl SentenceModel {
         cumulative.push(running);
         let mut hidden = Vec::with_capacity(tail.len());
         for step in 0..tail.len() {
-            let row = normed[step * n_embd..(step + 1) * n_embd].to_vec();
+            let row = Arc::new(HiddenState::new(
+                normed[step * n_embd..(step + 1) * n_embd].to_vec(),
+            ));
             if step + 1 < tail.len() {
                 running += self.log_probability(&row, tail[step + 1]);
                 cumulative.push(running);
@@ -629,16 +655,21 @@ impl SentenceModel {
         }
     }
 
-    /// log P(token) under the tied output projection, computed as the logit minus the log of the
-    /// summed exponentials. The full vocabulary is needed for the denominator, which is why this is
-    /// the most expensive step per scored character.
-    fn log_probability(&self, hidden: &[f32], token: u32) -> f32 {
+    /// 同一隐藏状态的完整词表只投影一次，后续 token 只计算自己的 logit。
+    fn log_probability(&self, hidden: &HiddenState, token: u32) -> f32 {
         let token = (token as usize).min(self.config.vocab - 1);
-        self.distribution(hidden)[token]
+        let offset = hidden
+            .log_normalizer
+            .get_or_init(|| self.project(&hidden.values).1);
+        self.token
+            .dot_row(&hidden.values, token, self.config.n_embd)
+            - offset
     }
 
-    /// log P over the whole vocabulary for the state at `hidden`.
-    fn distribution(&self, hidden: &[f32]) -> Vec<f32> {
+    /// 全词表 logits 与归一化常数保持既有的点积、最高值和指数求和顺序。
+    fn project(&self, hidden: &[f32]) -> (Vec<f32>, f32) {
+        #[cfg(test)]
+        VOCABULARY_PROJECTIONS.with(|count| count.set(count.get() + 1));
         let n_embd = self.config.n_embd;
         let mut logits = Vec::with_capacity(self.config.vocab);
         let mut highest = f32::NEG_INFINITY;
@@ -649,6 +680,12 @@ impl SentenceModel {
         }
         let sum: f32 = logits.iter().map(|logit| (logit - highest).exp()).sum();
         let offset = highest + sum.ln();
+        (logits, offset)
+    }
+
+    /// 返回每个 token 的对数概率，公开的完整分布入口仍计算所有行。
+    fn distribution(&self, hidden: &[f32]) -> Vec<f32> {
+        let (mut logits, offset) = self.project(hidden);
         for logit in &mut logits {
             *logit -= offset;
         }
@@ -666,7 +703,7 @@ impl SentenceModel {
         let room = self.config.context - 1;
         tokens.extend_from_slice(&encoded[encoded.len().saturating_sub(room)..]);
         let prefix = self.run_prefix(&tokens);
-        self.distribution(&prefix.last_hidden)
+        self.distribution(&prefix.last_hidden.values)
     }
 
     /// The identifier this model uses for `character`, when it has one.
@@ -1048,7 +1085,9 @@ mod tests {
     fn cache_test_model() -> std::sync::Arc<super::SentenceModel> {
         use super::{Block, Config, Matrix, SentenceModel};
         let matrix = |size| Matrix {
-            inner: super::Tensor::Float(vec![0.125; size]),
+            inner: super::Tensor::Float(
+                (0..size).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect(),
+            ),
         };
         std::sync::Arc::new(SentenceModel {
             config: Config {
@@ -1064,7 +1103,9 @@ mod tests {
                 .map(|(index, character)| (character, index as u32 + 3))
                 .collect(),
             token: matrix(8 * 4),
-            position: vec![0.0; 8 * 4],
+            position: (0..8 * 4)
+                .map(|i| (((i * 7) % 19) as f32 - 9.0) / 64.0)
+                .collect(),
             blocks: vec![Block {
                 ln1_weight: vec![1.0; 4],
                 ln1_bias: vec![0.0; 4],
@@ -1092,7 +1133,7 @@ mod tests {
         let before = reranker.log_probabilities("我", &["你好", "你吗"]);
         let retained = std::sync::Arc::downgrade(&reranker.resume[0].1);
         let allocation = reranker.resume[0].1.cumulative.as_ptr();
-        let hidden = reranker.resume[0].1.hidden[1].as_ptr();
+        let hidden = reranker.resume[0].1.hidden[1].values.as_ptr();
         // 重排、增删和重复候选不能消耗其它候选还要借用的旧状态。
         let after = reranker.log_probabilities("我", &["你吗我", "你好", "你好"]);
         assert_eq!(before[0].to_bits(), after[1].to_bits());
@@ -1105,7 +1146,7 @@ mod tests {
             );
             assert_eq!(
                 hidden,
-                reranker.resume[index].1.hidden[1].as_ptr(),
+                reranker.resume[index].1.hidden[1].values.as_ptr(),
                 "完全命中仍重新计算或复制了隐藏状态"
             );
         }
@@ -1115,6 +1156,52 @@ mod tests {
         reranker.log_probabilities("我", &[]);
         assert!(reranker.resume.is_empty());
         assert!(retained.upgrade().is_none());
+    }
+
+    #[test]
+    fn shared_prefix_normalization_is_computed_once() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        let count = || super::VOCABULARY_PROJECTIONS.with(std::cell::Cell::get);
+        let before = count();
+        reranker.log_probabilities("我", &["你好", "你吗"]);
+        // 上文投影一次，两条候选各自的首字状态各投影一次。
+        assert_eq!(count() - before, 3, "同一上文重复投影词表");
+
+        let before = count();
+        reranker.log_probabilities("我", &["你好我", "你好很"]);
+        assert_eq!(count() - before, 1, "同一续跑位置重复投影词表");
+
+        let before = count();
+        reranker.log_probabilities("我", &["你很", "你我"]);
+        assert_eq!(count() - before, 0, "已知归一化常数的共享位置仍重复计算");
+
+        let before = count();
+        reranker.log_probabilities("很", &["你好", "你吗"]);
+        assert_eq!(count() - before, 3, "上下文改变后必须使用新状态");
+    }
+
+    #[test]
+    fn cached_normalization_matches_full_distribution_bits() {
+        let model = cache_test_model();
+        for context in ["", "我", "你好我很"] {
+            let prefix = model.run_prefix(&model.prefix_tokens(context, 4));
+            let run = model.run_tail(&prefix, &[3, 4, 5, 6]);
+            assert!(
+                run.hidden.last().unwrap().log_normalizer.get().is_none(),
+                "未预测下一字的末位置不应提前投影词表"
+            );
+            for state in std::iter::once(&prefix.last_hidden).chain(&run.hidden) {
+                let full = model.distribution(&state.values);
+                for token in 0..model.config.vocab + 3 {
+                    let expected = full[token.min(model.config.vocab - 1)];
+                    assert_eq!(
+                        model.log_probability(state, token as u32).to_bits(),
+                        expected.to_bits(),
+                        "单 token 概率与完整分布不同"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
