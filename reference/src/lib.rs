@@ -20,6 +20,7 @@ thread_local! {
     static VOCABULARY_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -236,12 +237,11 @@ impl HiddenState {
     }
 }
 
-/// The per-layer keys and values for a prefix, so that scoring several candidates against the same
-/// committed text runs the prefix once instead of once per candidate.
-struct Prefix {
+/// 上文持有各层 KV；普通候选续跑借用已有 KV，可见位置由 length 限定。
+struct Prefix<'a> {
     length: usize,
-    keys: Vec<Vec<f32>>,
-    values: Vec<Vec<f32>>,
+    keys: Cow<'a, [Vec<f32>]>,
+    values: Cow<'a, [Vec<f32>]>,
     /// 前缀末位置预测候选首字，隐藏状态与它的归一化常数一起共享。
     last_hidden: Arc<HiddenState>,
 }
@@ -276,8 +276,8 @@ struct TailRun {
 }
 
 impl TailRun {
-    /// 恢复前 taken 个 token 后的前缀；普通位置截取已有 KV，经过末位置才补算一次。
-    fn resume(&self, taken: usize, model: &SentenceModel) -> (Prefix, f32) {
+    /// 恢复前 taken 个 token 后的前缀；普通位置借用已有 KV，经过末位置才补算一次。
+    fn resume(&self, taken: usize, model: &SentenceModel) -> (Prefix<'_>, f32) {
         let n_embd = model.config.n_embd;
         debug_assert!(taken > 0 && taken <= self.cumulative.len());
         if taken > self.hidden.len() {
@@ -317,23 +317,18 @@ impl TailRun {
             return (
                 Prefix {
                     length: self.base + taken,
-                    keys: append(&self.keys, &terminal.keys),
-                    values: append(&self.values, &terminal.values),
+                    keys: Cow::Owned(append(&self.keys, &terminal.keys)),
+                    values: Cow::Owned(append(&self.values, &terminal.values)),
                     last_hidden: terminal.hidden.clone(),
                 },
                 self.cumulative[taken - 1],
             );
         }
-        let width = (self.base + taken) * n_embd;
         (
             Prefix {
                 length: self.base + taken,
-                keys: self.keys.iter().map(|key| key[..width].to_vec()).collect(),
-                values: self
-                    .values
-                    .iter()
-                    .map(|value| value[..width].to_vec())
-                    .collect(),
+                keys: Cow::Borrowed(&self.keys),
+                values: Cow::Borrowed(&self.values),
                 last_hidden: self.hidden[taken - 1].clone(),
             },
             self.cumulative[taken - 1],
@@ -585,7 +580,7 @@ impl SentenceModel {
         tokens
     }
 
-    fn score_against(&self, prefix: &Prefix, candidates: &[&str]) -> Vec<f32> {
+    fn score_against(&self, prefix: &Prefix<'_>, candidates: &[&str]) -> Vec<f32> {
         candidates
             .iter()
             .map(|text| {
@@ -619,7 +614,7 @@ impl SentenceModel {
     }
 
     /// Runs the prefix and keeps every layer's keys and values.
-    fn run_prefix(&self, tokens: &[u32]) -> Prefix {
+    fn run_prefix(&self, tokens: &[u32]) -> Prefix<'static> {
         let n_embd = self.config.n_embd;
         let mut x = self.embed(tokens, 0);
         let mut keys = Vec::with_capacity(self.blocks.len());
@@ -658,14 +653,14 @@ impl SentenceModel {
         )));
         Prefix {
             length: tokens.len(),
-            keys,
-            values,
+            keys: Cow::Owned(keys),
+            values: Cow::Owned(values),
             last_hidden,
         }
     }
 
     /// Runs a candidate against a cached prefix and returns its total log-probability.
-    fn score_tail(&self, prefix: &Prefix, tail: &[u32]) -> f32 {
+    fn score_tail(&self, prefix: &Prefix<'_>, tail: &[u32]) -> f32 {
         let run = self.run_tail(prefix, tail);
         run.cumulative[run.cumulative.len() - 1]
     }
@@ -673,7 +668,7 @@ impl SentenceModel {
     /// 完整累计分只需要前 length-1 个隐藏状态；末位置留给真正经过它的续跑。
     ///
     /// 分段累计仍沿用既有分组：carried + rest，不改变 token 的先后顺序。
-    fn run_tail(&self, prefix: &Prefix, tail: &[u32]) -> TailRun {
+    fn run_tail(&self, prefix: &Prefix<'_>, tail: &[u32]) -> TailRun {
         let states = self.run_tail_states(
             prefix.length,
             &prefix.keys,
@@ -706,10 +701,18 @@ impl SentenceModel {
         prefix_values: &[Vec<f32>],
         tokens: &[u32],
     ) -> TailStates {
+        // 借用的旧 KV 可能更长，只复制本次续跑可见的位置。
+        let prefix_width = length * self.config.n_embd;
         if tokens.is_empty() {
             return TailStates {
-                keys: prefix_keys.to_vec(),
-                values: prefix_values.to_vec(),
+                keys: prefix_keys
+                    .iter()
+                    .map(|row| row[..prefix_width].to_vec())
+                    .collect(),
+                values: prefix_values
+                    .iter()
+                    .map(|row| row[..prefix_width].to_vec())
+                    .collect(),
                 hidden: Vec::new(),
             };
         }
@@ -727,8 +730,8 @@ impl SentenceModel {
                 3 * n_embd,
             );
             let (q, k, v) = split_qkv(&qkv, tokens.len(), n_embd);
-            let mut keys = prefix_keys[layer].clone();
-            let mut values = prefix_values[layer].clone();
+            let mut keys = prefix_keys[layer][..prefix_width].to_vec();
+            let mut values = prefix_values[layer][..prefix_width].to_vec();
             keys.extend_from_slice(&k);
             values.extend_from_slice(&v);
             let attended = self.attention(&q, &keys, &values, tokens.len(), length);
@@ -887,7 +890,7 @@ pub struct Reranker {
     /// Shared, because the weights are read-only and a host opens a session per focus change.
     /// Only the cached prefix belongs to one session.
     model: Arc<SentenceModel>,
-    cached: Option<(Vec<u32>, Prefix)>,
+    cached: Option<(Vec<u32>, Prefix<'static>)>,
     /// What the previous decision ended up knowing, one entry per candidate it scored: the tokens
     /// it ran, the state it left the model in, and the log-probability accumulated over them.
     ///
@@ -1368,6 +1371,80 @@ mod tests {
         let before = count();
         reranker.log_probabilities("我", &["你很好", "你", "你很好"]);
         assert_eq!(count() - before, 0, "缩短候选不应补算末位置");
+    }
+
+    #[test]
+    fn ordinary_resume_borrows_the_existing_kv_storage() {
+        let model = cache_test_model();
+        let prefix = model.run_prefix(&model.prefix_tokens("我", 4));
+        let run = model.run_tail(&prefix, &model.encode("你好我很"));
+        let (resumed, _) = run.resume(1, &model);
+        assert_eq!(
+            resumed.keys.as_ptr(),
+            run.keys.as_ptr(),
+            "普通续跑复制了 KV 外层数组"
+        );
+        for (left, right) in resumed.keys.iter().zip(&run.keys) {
+            assert_eq!(left.as_ptr(), right.as_ptr(), "普通续跑复制了 key");
+        }
+        for (left, right) in resumed.values.iter().zip(&run.values) {
+            assert_eq!(left.as_ptr(), right.as_ptr(), "普通续跑复制了 value");
+        }
+    }
+
+    #[test]
+    fn borrowed_resume_matches_a_truncated_owned_prefix() {
+        let model = cache_test_model();
+        let prefix = model.run_prefix(&model.prefix_tokens("我", 4));
+        let run = model.run_tail(&prefix, &model.encode("你好我很"));
+        for taken in 1..=run.cumulative.len() {
+            let (resumed, carried) = run.resume(taken, &model);
+            let width = resumed.length * model.config.n_embd;
+            let owned = super::Prefix {
+                length: resumed.length,
+                keys: std::borrow::Cow::Owned(
+                    resumed
+                        .keys
+                        .iter()
+                        .map(|row| row[..width].to_vec())
+                        .collect(),
+                ),
+                values: std::borrow::Cow::Owned(
+                    resumed
+                        .values
+                        .iter()
+                        .map(|row| row[..width].to_vec())
+                        .collect(),
+                ),
+                last_hidden: resumed.last_hidden.clone(),
+            };
+            assert_eq!(carried.to_bits(), run.cumulative[taken - 1].to_bits());
+            for text in ["吗", "吗你", "吗你好"] {
+                let tail = model.encode(text);
+                let actual = model.run_tail(&resumed, &tail);
+                let expected = model.run_tail(&owned, &tail);
+                assert_eq!(actual.base, expected.base);
+                assert_eq!(actual.pending, expected.pending);
+                assert_eq!(actual.keys, expected.keys);
+                assert_eq!(actual.values, expected.values);
+                assert_eq!(actual.hidden.len(), expected.hidden.len());
+                assert_eq!(
+                    actual
+                        .cumulative
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .cumulative
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                for (left, right) in actual.hidden.iter().zip(&expected.hidden) {
+                    assert_eq!(left.values, right.values);
+                }
+            }
+        }
     }
 
     #[test]
