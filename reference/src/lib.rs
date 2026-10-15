@@ -1034,7 +1034,7 @@ impl Reranker {
             previous.clear();
         }
         scores.clear();
-        scores.reserve(capacity.saturating_sub(scores.capacity()));
+        scores.reserve_exact(capacity);
         let limit = self
             .model
             .config
@@ -1450,6 +1450,21 @@ mod tests {
         assert!(reranker.scores_scratch.capacity() >= 2);
         reranker.best_where("我", &["你很", "你我"], &facts);
         assert_eq!(reranker.scores_scratch.as_ptr(), spare);
+    }
+
+    #[test]
+    fn growing_candidate_lists_keep_score_storage_within_the_comparison_budget() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        let texts = ["你好"; 9];
+        let facts = answering(&[true; 9]);
+        for count in 2..=texts.len() {
+            reranker.best_where("我", &texts[..count], &facts);
+            assert!(
+                reranker.scores_scratch.capacity() <= texts.len(),
+                "{count} candidates retain capacity {}",
+                reranker.scores_scratch.capacity()
+            );
+        }
     }
 
     #[test]
