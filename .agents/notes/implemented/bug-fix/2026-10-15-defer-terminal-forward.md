@@ -14,6 +14,8 @@ Status: implemented
 
 已检索 `run_tail`、`resume`、隐藏状态与末位置笔记。[完全命中缓存](../../implemented/bug-fix/2026-10-15-identical-rerank-cache.md)继续持有完整累计分及上一轮寿命；[共享归一化](../../implemented/bug-fix/2026-10-15-shared-state-normalization.md)继续持有每个隐藏状态的归一化缓存。本篇补充末位置按需计算，不翻转评分或缓存约束。[行分派负结果](../../rejected/bug-fix/2026-10-15-matrix-row-dispatch.md)与[行交错负结果](../../rejected/bug-fix/2026-10-15-matrix-row-batching.md)属于不同机制，无需改写。
 
+本批已算状态的复用由[同批候选缓存](2026-10-15-same-batch-cache.md)补充，上一轮完全命中和等长部分匹配的优先级保持。
+
 ## Alternatives considered
 
 - 一直提前计算末位置：续跑代码最简单，延长时无需补算，但末字改变和候选消失时浪费一次完整前向。
