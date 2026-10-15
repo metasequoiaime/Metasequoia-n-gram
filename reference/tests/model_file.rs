@@ -318,6 +318,41 @@ fn geometry_that_disagrees_with_the_configuration_is_rejected() {
 }
 
 #[test]
+fn quantized_row_counts_must_match_runtime_geometry() {
+    for name in [
+        "tok.weight",
+        "blocks.0.qkv.weight",
+        "blocks.0.proj.weight",
+        "blocks.0.fc.weight",
+        "blocks.0.out.weight",
+    ] {
+        for extra_rows in [false, true] {
+            let mut builder = complete("int8");
+            let (_, shape, tensor) = builder
+                .entries
+                .iter_mut()
+                .find(|(tensor_name, ..)| tensor_name == name)
+                .expect("matrix");
+            // 保持元素总数不变，让文件形状和 scale 彼此一致，但与运行时行数不符。
+            if extra_rows {
+                shape[0] *= 2;
+                shape[1] /= 2;
+            } else {
+                shape[0] /= 2;
+                shape[1] *= 2;
+            }
+            let Tensor::I8(_, scales) = tensor else {
+                panic!("expected quantized matrix");
+            };
+            scales.resize(shape[0], 1.0);
+            let error = SentenceModel::load(&builder.finish())
+                .expect_err("accepted incompatible quantized row count");
+            assert!(matches!(error, ModelError::Geometry(_)), "{name}: {error}");
+        }
+    }
+}
+
+#[test]
 fn a_missing_tensor_names_itself() {
     let mut builder = complete("f32");
     builder
