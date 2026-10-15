@@ -482,29 +482,40 @@ impl SentenceModel {
                 ModelError::Geometry(format!("{name} holds {actual}, wanted {wanted}"))
             })
         };
-        expect("tok.weight", self.token.len(), vocab * n_embd)?;
+        let expect_matrix = |name: &str, matrix: &Matrix, rows: usize, columns: usize| {
+            expect(name, matrix.len(), rows * columns)?;
+            if let Tensor::Quantized { scales, .. } = &matrix.inner {
+                expect(&format!("{name}.scale"), scales.len(), rows)?;
+            }
+            Ok(())
+        };
+        expect_matrix("tok.weight", &self.token, vocab, n_embd)?;
         expect("pos.weight", self.position.len(), context * n_embd)?;
         expect("ln_f.weight", self.final_weight.len(), n_embd)?;
         for (layer, block) in self.blocks.iter().enumerate() {
-            expect(
+            expect_matrix(
                 &format!("blocks.{layer}.qkv"),
-                block.qkv_weight.len(),
-                3 * n_embd * n_embd,
+                &block.qkv_weight,
+                3 * n_embd,
+                n_embd,
             )?;
-            expect(
+            expect_matrix(
                 &format!("blocks.{layer}.proj"),
-                block.proj_weight.len(),
-                n_embd * n_embd,
+                &block.proj_weight,
+                n_embd,
+                n_embd,
             )?;
-            expect(
+            expect_matrix(
                 &format!("blocks.{layer}.fc"),
-                block.fc_weight.len(),
-                4 * n_embd * n_embd,
+                &block.fc_weight,
+                4 * n_embd,
+                n_embd,
             )?;
-            expect(
+            expect_matrix(
                 &format!("blocks.{layer}.out"),
-                block.out_weight.len(),
-                4 * n_embd * n_embd,
+                &block.out_weight,
+                n_embd,
+                4 * n_embd,
             )?;
         }
         Ok(())
@@ -806,10 +817,25 @@ impl SentenceModel {
         let n_embd = self.config.n_embd;
         let mut logits = Vec::with_capacity(self.config.vocab);
         let mut highest = f32::NEG_INFINITY;
-        for row in 0..self.config.vocab {
-            let logit = self.token.dot_row(hidden, row, n_embd);
-            highest = highest.max(logit);
-            logits.push(logit);
+        match &self.token.inner {
+            Tensor::Float(values) => {
+                for row in values.chunks_exact(n_embd).take(self.config.vocab) {
+                    let logit = dot(hidden, row);
+                    highest = highest.max(logit);
+                    logits.push(logit);
+                }
+            }
+            Tensor::Quantized { values, scales } => {
+                for (row, &scale) in values
+                    .chunks_exact(n_embd)
+                    .zip(&scales[..self.config.vocab])
+                    .take(self.config.vocab)
+                {
+                    let logit = dot_i8(hidden, row) * scale;
+                    highest = highest.max(logit);
+                    logits.push(logit);
+                }
+            }
         }
         let sum: f32 = logits.iter().map(|logit| (logit - highest).exp()).sum();
         let offset = highest + sum.ln();
@@ -1259,6 +1285,7 @@ fn erf(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     mod bounded_encoding;
+    mod project_rows;
 
     use super::{comparable, erf, gelu, should_rerank, CandidateFacts, Compared};
 
