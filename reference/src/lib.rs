@@ -108,6 +108,32 @@ pub struct CandidateFacts {
 /// rather than a limit that normally binds.
 const COMPARED: usize = 9;
 
+/// The bounded set of candidate indices that answer the current key. Keeping the ceiling in the
+/// type avoids allocating a temporary `Vec` before every reranking call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Compared {
+    indices: [usize; COMPARED],
+    len: usize,
+}
+
+impl Compared {
+    fn new() -> Self {
+        Self {
+            indices: [0; COMPARED],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, index: usize) {
+        self.indices[self.len] = index;
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        &self.indices[..self.len]
+    }
+}
+
 const UNK: u32 = 1;
 const BOS: u32 = 2;
 
@@ -934,15 +960,14 @@ impl Reranker {
         facts: impl Fn(usize) -> CandidateFacts,
     ) -> Option<usize> {
         let considered = comparable(texts.len(), &facts)?;
-        let subset: Vec<&str> = considered.iter().map(|&index| texts[index]).collect();
-        let scores = self.score(context, &subset);
+        let scores = self.score_indices(context, texts, considered.as_slice().iter().copied());
         let mut best = 0;
         for (index, score) in scores.iter().enumerate() {
             if *score > scores[best] {
                 best = index;
             }
         }
-        (best != 0).then(|| considered[best])
+        (best != 0).then(|| considered.as_slice()[best])
     }
 
     /// Mean log-probability per character for each candidate, in the order given.
@@ -955,9 +980,18 @@ impl Reranker {
     }
 
     fn score(&mut self, context: &str, candidates: &[&str]) -> Vec<f32> {
-        let longest = candidates
-            .iter()
-            .map(|text| text.chars().count())
+        self.score_indices(context, candidates, 0..candidates.len())
+    }
+
+    fn score_indices(
+        &mut self,
+        context: &str,
+        candidates: &[&str],
+        indices: impl Iterator<Item = usize> + Clone,
+    ) -> Vec<f32> {
+        let longest = indices
+            .clone()
+            .map(|index| candidates[index].chars().count())
             .max()
             .unwrap_or(0);
         // Keyed on the tokens rather than the context string, because two different contexts that
@@ -974,16 +1008,17 @@ impl Reranker {
             self.resume.clear();
         }
         let (_, prefix) = self.cached.as_ref().expect("prefix was just computed");
-        let mut next = Vec::with_capacity(candidates.len());
-        let mut scores = Vec::with_capacity(candidates.len());
+        let capacity = indices.size_hint().0;
+        let mut next = Vec::with_capacity(capacity);
+        let mut scores = Vec::with_capacity(capacity);
         let limit = self
             .model
             .config
             .context
             .saturating_sub(prefix.length)
             .max(1);
-        for text in candidates {
-            let tail = self.model.encode_limited(text, limit);
+        for index in indices {
+            let tail = self.model.encode_limited(candidates[index], limit);
             if tail.is_empty() {
                 scores.push(f32::NEG_INFINITY);
                 continue;
@@ -1037,7 +1072,7 @@ impl Reranker {
 /// Separate from scoring and free of the model, because this is the part that decides what the
 /// measurements mean: every published accuracy number for this crate is a consequence of which
 /// candidates were allowed into the comparison, so it is worth being able to test on its own.
-fn comparable(count: usize, facts: &impl Fn(usize) -> CandidateFacts) -> Option<Vec<usize>> {
+fn comparable(count: usize, facts: &impl Fn(usize) -> CandidateFacts) -> Option<Compared> {
     if count == 0 {
         return None;
     }
@@ -1048,11 +1083,14 @@ fn comparable(count: usize, facts: &impl Fn(usize) -> CandidateFacts) -> Option<
     if leader.trusted_dictionary_hit || !leader.answers_key {
         return None;
     }
-    let considered: Vec<usize> = (0..count)
-        .filter(|&index| facts(index).answers_key)
-        .take(COMPARED)
-        .collect();
-    (considered.len() >= 2).then_some(considered)
+    let mut considered = Compared::new();
+    for index in (0..count).filter(|&index| facts(index).answers_key) {
+        if considered.len == COMPARED {
+            break;
+        }
+        considered.push(index);
+    }
+    (considered.len >= 2).then_some(considered)
 }
 
 /// Whether the model should be consulted at all, given the sources the engine reported in order.
@@ -1183,7 +1221,7 @@ fn erf(x: f32) -> f32 {
 mod tests {
     mod bounded_encoding;
 
-    use super::{comparable, erf, gelu, should_rerank, CandidateFacts};
+    use super::{comparable, erf, gelu, should_rerank, CandidateFacts, Compared};
 
     // 一层小模型只使用合成权重，缓存测试不读取外部模型文件。
     fn cache_test_model() -> std::sync::Arc<super::SentenceModel> {
@@ -1461,14 +1499,47 @@ mod tests {
     fn only_candidates_answering_the_key_are_compared() {
         // A prefix and a completion sit among the full answers and stay out of the comparison.
         let flags = [true, false, true, false, true];
-        assert_eq!(comparable(5, &answering(&flags)), Some(vec![0, 2, 4]));
+        assert_eq!(
+            comparable(5, &answering(&flags)).unwrap().as_slice(),
+            &[0, 2, 4]
+        );
     }
 
     #[test]
     fn differing_character_counts_are_compared_when_both_answer_the_key() {
         // The case the old length proxy dropped: `xian` reads as 现 or as 西安, both consuming the
         // key. Nothing here looks at the text, which is the point — length is not the criterion.
-        assert_eq!(comparable(2, &answering(&[true, true])), Some(vec![0, 1]));
+        assert_eq!(
+            comparable(2, &answering(&[true, true])).unwrap().as_slice(),
+            &[0, 1]
+        );
+    }
+
+    #[test]
+    fn comparable_indices_use_fixed_storage() {
+        let result = comparable(3, &answering(&[true, false, true])).unwrap();
+        assert_eq!(
+            std::mem::size_of_val(&result),
+            std::mem::size_of::<Compared>()
+        );
+    }
+
+    #[test]
+    fn best_where_keeps_original_candidate_indices() {
+        let model = cache_test_model();
+        let texts = ["吗我", "你吗", "你好", "你很"];
+        let considered = [texts[0], texts[2], texts[3]];
+        let expected_scores = super::SentenceModel::score(&model, "我", &considered);
+        let expected = expected_scores
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(position, _)| [0, 2, 3][position])
+            .expect("at least one comparable candidate");
+
+        let mut reranker = super::Reranker::new(model);
+        let actual = reranker.best_where("我", &texts, answering(&[true, false, true, true]));
+        assert_eq!(actual, (expected != 0).then_some(expected));
     }
 
     #[test]
@@ -1483,7 +1554,7 @@ mod tests {
             answers_key: true,
             trusted_dictionary_hit: index == 2,
         };
-        assert_eq!(comparable(3, &trailing), Some(vec![0, 1, 2]));
+        assert_eq!(comparable(3, &trailing).unwrap().as_slice(), &[0, 1, 2]);
     }
 
     #[test]
@@ -1503,8 +1574,8 @@ mod tests {
     fn the_comparison_is_capped_and_keeps_the_leader() {
         let flags = [true; 12];
         let considered = comparable(12, &answering(&flags)).expect("all answer the key");
-        assert_eq!(considered.len(), super::COMPARED);
-        assert_eq!(considered[0], 0);
+        assert_eq!(considered.as_slice().len(), super::COMPARED);
+        assert_eq!(considered.as_slice()[0], 0);
     }
 
     #[test]
