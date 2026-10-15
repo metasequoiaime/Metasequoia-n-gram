@@ -111,6 +111,11 @@ const COMPARED: usize = 9;
 const UNK: u32 = 1;
 const BOS: u32 = 2;
 
+#[cfg(test)]
+std::thread_local! {
+    static FORWARD_POSITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
     #[error("model file is truncated")]
@@ -212,26 +217,84 @@ struct Prefix {
     last_hidden: Arc<HiddenState>,
 }
 
+// 一段已完成前向的位置；累计分仍由调用者按原顺序计算。
+struct TailStates {
+    keys: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
+    hidden: Vec<Arc<HiddenState>>,
+}
+
+// 末位置只保存新增的一行 KV，不重复持有整段前缀。
+struct TerminalState {
+    keys: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
+    hidden: Arc<HiddenState>,
+}
+
 /// Everything one candidate's run passed through, so that a later run agreeing with part of it can
 /// start from where they stop agreeing instead of from the beginning.
 struct TailRun {
-    /// How many prefix positions sit in front of `keys` and `values`, which hold the prefix's
-    /// entries followed by this run's.
+    /// 上文占用的绝对位置数；KV 仅包含上文及已前向的位置，比累计分少一个候选位置。
     base: usize,
     keys: Vec<Vec<f32>>,
     values: Vec<Vec<f32>>,
-    /// 每个位置预测下一字的隐藏状态；共享续跑时保留已计算的归一化常数。
+    /// 已计算位置预测下一字的隐藏状态；末 token 只在续跑经过它时前向。
     hidden: Vec<Arc<HiddenState>>,
-    /// Log-probability of the run's first `i + 1` tokens, summed left to right.
+    /// 前 i+1 个 token 的完整累计对数概率，保留原来的累加分组。
     cumulative: Vec<f32>,
+    pending: u32,
+    terminal: OnceLock<TerminalState>,
 }
 
 impl TailRun {
-    /// The state after `taken` of this run's tokens, as a prefix a continuation can run against.
-    ///
-    /// The keys and values are truncated rather than rebuilt: position `taken`'s cache is the
-    /// leading part of the one already held.
-    fn resume(&self, taken: usize, n_embd: usize) -> (Prefix, f32) {
+    /// 恢复前 taken 个 token 后的前缀；普通位置截取已有 KV，经过末位置才补算一次。
+    fn resume(&self, taken: usize, model: &SentenceModel) -> (Prefix, f32) {
+        let n_embd = model.config.n_embd;
+        debug_assert!(taken > 0 && taken <= self.cumulative.len());
+        if taken > self.hidden.len() {
+            let terminal = self.terminal.get_or_init(|| {
+                let mut states = model.run_tail_states(
+                    self.base + self.hidden.len(),
+                    &self.keys,
+                    &self.values,
+                    &[self.pending],
+                );
+                let width = (self.base + self.hidden.len()) * n_embd;
+                TerminalState {
+                    keys: states
+                        .keys
+                        .iter_mut()
+                        .map(|row| row.split_off(width))
+                        .collect(),
+                    values: states
+                        .values
+                        .iter_mut()
+                        .map(|row| row.split_off(width))
+                        .collect(),
+                    hidden: states.hidden.pop().expect("末位置已有前向结果"),
+                }
+            });
+            let append = |prefix: &[Vec<f32>], last: &[Vec<f32>]| {
+                prefix
+                    .iter()
+                    .zip(last)
+                    .map(|(prefix, last)| {
+                        let mut row = prefix.clone();
+                        row.extend_from_slice(last);
+                        row
+                    })
+                    .collect()
+            };
+            return (
+                Prefix {
+                    length: self.base + taken,
+                    keys: append(&self.keys, &terminal.keys),
+                    values: append(&self.values, &terminal.values),
+                    last_hidden: terminal.hidden.clone(),
+                },
+                self.cumulative[taken - 1],
+            );
+        }
         let width = (self.base + taken) * n_embd;
         (
             Prefix {
@@ -248,16 +311,30 @@ impl TailRun {
         )
     }
 
-    /// This run's leading `taken` positions followed by `rest`, as one run over the whole
-    /// candidate, so the next keystroke can resume anywhere along it.
+    /// 把已有前 taken 个位置与 rest 拼为完整候选，供下次按键从任意共享位置续跑。
     fn joined(&self, taken: usize, carried: f32, rest: TailRun) -> TailRun {
+        // resume 已补齐经过的末位置，joined 共享它，保留同一份归一化缓存。
+        let terminal = if taken > self.hidden.len() {
+            Some(
+                self.terminal
+                    .get()
+                    .expect("拼接前已恢复末位置")
+                    .hidden
+                    .clone(),
+            )
+        } else {
+            None
+        };
         TailRun {
             base: self.base,
             keys: rest.keys,
             values: rest.values,
-            hidden: self.hidden[..taken]
+            hidden: self
+                .hidden
                 .iter()
+                .take(taken)
                 .cloned()
+                .chain(terminal)
                 .chain(rest.hidden)
                 .collect(),
             cumulative: self.cumulative[..taken]
@@ -265,6 +342,8 @@ impl TailRun {
                 .copied()
                 .chain(rest.cumulative.iter().map(|value| carried + value))
                 .collect(),
+            pending: rest.pending,
+            terminal: rest.terminal,
         }
     }
 }
@@ -481,6 +560,8 @@ impl SentenceModel {
     }
 
     fn embed(&self, tokens: &[u32], offset: usize) -> Vec<f32> {
+        #[cfg(test)]
+        FORWARD_POSITIONS.with(|count| count.set(count.get() + tokens.len()));
         let n_embd = self.config.n_embd;
         let mut x = vec![0.0; tokens.len() * n_embd];
         for (step, &token) in tokens.iter().enumerate() {
@@ -548,30 +629,51 @@ impl SentenceModel {
         run.cumulative[run.cumulative.len() - 1]
     }
 
-    /// The same run, keeping everything it passed through rather than only the total.
+    /// 完整累计分只需要前 length-1 个隐藏状态；末位置留给真正经过它的续跑。
     ///
-    /// `score_tail` builds the extended keys and values in order to attend over them and then drops
-    /// them, along with the hidden state at every position and the running sum. Those are what a
-    /// caller needs to stop part-way through a candidate and resume somewhere else, which is the
-    /// whole point: consecutive keystrokes re-score candidates that mostly repeat the previous
-    /// keystroke's, and the repeated part need not be run twice.
-    ///
-    /// Keeping every position rather than only the last one is what makes partial agreement usable.
-    /// Candidates typically share a leading stretch and then diverge — the decoder revises the last
-    /// character or two as a syllable completes — so a resume point that only exists at the end of
-    /// a candidate is one almost nothing matches. Position-wise, the shared stretch is reusable
-    /// however far it runs.
-    ///
-    /// The keys and values are stored whole and truncated when resumed: position `k`'s cache is a
-    /// prefix of the full one, so a shorter resume costs a slice rather than a separate copy. Cost
-    /// is therefore linear in the candidate's length, not quadratic.
-    ///
-    /// Grouping the sum differently is the one thing resuming does change. `(a + b) + c` and
-    /// `a + (b + c)` are not the same f32, so a resumed score can differ from a single-pass score
-    /// in the last place. The eval covers both paths rather than a unit test asserting equality.
+    /// 分段累计仍沿用既有分组：carried + rest，不改变 token 的先后顺序。
     fn run_tail(&self, prefix: &Prefix, tail: &[u32]) -> TailRun {
+        let states = self.run_tail_states(
+            prefix.length,
+            &prefix.keys,
+            &prefix.values,
+            &tail[..tail.len() - 1],
+        );
+        let mut running = self.log_probability(&prefix.last_hidden, tail[0]);
+        let mut cumulative = Vec::with_capacity(tail.len());
+        cumulative.push(running);
+        for (state, &next) in states.hidden.iter().zip(&tail[1..]) {
+            running += self.log_probability(state, next);
+            cumulative.push(running);
+        }
+        TailRun {
+            base: prefix.length,
+            keys: states.keys,
+            values: states.values,
+            hidden: states.hidden,
+            cumulative,
+            pending: *tail.last().expect("候选至少有一个 token"),
+            terminal: OnceLock::new(),
+        }
+    }
+
+    /// 仅计算需要的因果位置；空段只保留上文 KV，单字评分无需前向。
+    fn run_tail_states(
+        &self,
+        length: usize,
+        prefix_keys: &[Vec<f32>],
+        prefix_values: &[Vec<f32>],
+        tokens: &[u32],
+    ) -> TailStates {
+        if tokens.is_empty() {
+            return TailStates {
+                keys: prefix_keys.to_vec(),
+                values: prefix_values.to_vec(),
+                hidden: Vec::new(),
+            };
+        }
         let n_embd = self.config.n_embd;
-        let mut x = self.embed(tail, prefix.length);
+        let mut x = self.embed(tokens, length);
         let mut keys_out = Vec::with_capacity(self.blocks.len());
         let mut values_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
@@ -583,12 +685,12 @@ impl SentenceModel {
                 n_embd,
                 3 * n_embd,
             );
-            let (q, k, v) = split_qkv(&qkv, tail.len(), n_embd);
-            let mut keys = prefix.keys[layer].clone();
-            let mut values = prefix.values[layer].clone();
+            let (q, k, v) = split_qkv(&qkv, tokens.len(), n_embd);
+            let mut keys = prefix_keys[layer].clone();
+            let mut values = prefix_values[layer].clone();
             keys.extend_from_slice(&k);
             values.extend_from_slice(&v);
-            let attended = self.attention(&q, &keys, &values, tail.len(), prefix.length);
+            let attended = self.attention(&q, &keys, &values, tokens.len(), length);
             let projected = linear(
                 &attended,
                 &block.proj_weight,
@@ -605,28 +707,13 @@ impl SentenceModel {
         }
         let normed = layer_norm(&x, &self.final_weight, &self.final_bias, n_embd);
 
-        // Position i predicts token i + 1. The opening character is therefore predicted by the last
-        // prefix position, and every later one by the tail position before it.
-        let mut running = self.log_probability(&prefix.last_hidden, tail[0]);
-        let mut cumulative = Vec::with_capacity(tail.len());
-        cumulative.push(running);
-        let mut hidden = Vec::with_capacity(tail.len());
-        for step in 0..tail.len() {
-            let row = Arc::new(HiddenState::new(
-                normed[step * n_embd..(step + 1) * n_embd].to_vec(),
-            ));
-            if step + 1 < tail.len() {
-                running += self.log_probability(&row, tail[step + 1]);
-                cumulative.push(running);
-            }
-            hidden.push(row);
-        }
-        TailRun {
-            base: prefix.length,
+        TailStates {
             keys: keys_out,
             values: values_out,
-            hidden,
-            cumulative,
+            hidden: normed
+                .chunks_exact(n_embd)
+                .map(|row| Arc::new(HiddenState::new(row.to_vec())))
+                .collect(),
         }
     }
 
@@ -872,8 +959,6 @@ impl Reranker {
             self.resume.clear();
         }
         let (_, prefix) = self.cached.as_ref().expect("prefix was just computed");
-        let n_embd = self.model.config.n_embd;
-
         let mut next = Vec::with_capacity(candidates.len());
         let mut scores = Vec::with_capacity(candidates.len());
         for text in candidates {
@@ -915,7 +1000,7 @@ impl Reranker {
 
             let run = match shared {
                 Some((index, agreed)) if agreed > 0 => {
-                    let (from, carried) = self.resume[index].1.resume(agreed, n_embd);
+                    let (from, carried) = self.resume[index].1.resume(agreed, &self.model);
                     let rest = self.model.run_tail(&from, &tail[agreed..]);
                     self.resume[index].1.joined(agreed, carried, rest)
                 }
@@ -1128,12 +1213,56 @@ mod tests {
     }
 
     #[test]
+    fn terminal_forward_waits_for_a_shared_continuation() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        let count = || super::FORWARD_POSITIONS.with(std::cell::Cell::get);
+        let before = count();
+        reranker.log_probabilities("我", &["你好", "你吗"]);
+        assert_eq!(
+            count() - before,
+            4,
+            "上文和 BOS 加两个首字，候选末字无需前向"
+        );
+
+        let before = count();
+        reranker.log_probabilities("我", &["你很", "你我"]);
+        assert_eq!(count() - before, 0, "只改末字仍做了前向");
+
+        let before = count();
+        reranker.log_probabilities("我", &["你很好", "你很吗"]);
+        assert_eq!(count() - before, 1, "同一末位置应只按需补算一次");
+
+        let before = count();
+        reranker.log_probabilities("我", &["你很好我", "你很好吗"]);
+        assert_eq!(count() - before, 1, "拼接后的末位置仍应共享补算");
+
+        let before = count();
+        reranker.log_probabilities("我", &["你很好", "你", "你很好"]);
+        assert_eq!(count() - before, 0, "缩短候选不应补算末位置");
+    }
+
+    #[test]
+    fn a_single_character_tail_can_be_extended_without_an_eager_state() {
+        let model = cache_test_model();
+        let mut reranker = super::Reranker::new(model.clone());
+        let count = || super::FORWARD_POSITIONS.with(std::cell::Cell::get);
+        let before = count();
+        reranker.log_probabilities("我", &["你", "我"]);
+        assert_eq!(count() - before, 2, "单字候选只需要上文前向");
+        let before = count();
+        let scores = reranker.log_probabilities("我", &["你好", "你吗"]);
+        assert_eq!(count() - before, 1, "没有已计算候选位置时也应共享末字补算");
+        let fresh = model.score("我", &["你好", "你吗"]);
+        assert_eq!(scores, fresh);
+    }
+
+    #[test]
     fn identical_candidates_keep_the_completed_run() {
         let mut reranker = super::Reranker::new(cache_test_model());
         let before = reranker.log_probabilities("我", &["你好", "你吗"]);
         let retained = std::sync::Arc::downgrade(&reranker.resume[0].1);
         let allocation = reranker.resume[0].1.cumulative.as_ptr();
-        let hidden = reranker.resume[0].1.hidden[1].values.as_ptr();
+        let hidden = reranker.resume[0].1.hidden[0].values.as_ptr();
         // 重排、增删和重复候选不能消耗其它候选还要借用的旧状态。
         let after = reranker.log_probabilities("我", &["你吗我", "你好", "你好"]);
         assert_eq!(before[0].to_bits(), after[1].to_bits());
@@ -1146,7 +1275,7 @@ mod tests {
             );
             assert_eq!(
                 hidden,
-                reranker.resume[index].1.hidden[1].values.as_ptr(),
+                reranker.resume[index].1.hidden[0].values.as_ptr(),
                 "完全命中仍重新计算或复制了隐藏状态"
             );
         }
@@ -1186,10 +1315,7 @@ mod tests {
         for context in ["", "我", "你好我很"] {
             let prefix = model.run_prefix(&model.prefix_tokens(context, 4));
             let run = model.run_tail(&prefix, &[3, 4, 5, 6]);
-            assert!(
-                run.hidden.last().unwrap().log_normalizer.get().is_none(),
-                "未预测下一字的末位置不应提前投影词表"
-            );
+            assert!(run.terminal.get().is_none(), "未续跑的末位置不应提前计算");
             for state in std::iter::once(&prefix.last_hidden).chain(&run.hidden) {
                 let full = model.distribution(&state.values);
                 for token in 0..model.config.vocab + 3 {

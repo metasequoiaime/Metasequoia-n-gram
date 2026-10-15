@@ -12,6 +12,8 @@ Status: implemented
 
 部分共享位置的概率归一化由[共享状态归一化](2026-10-15-shared-state-normalization.md)补充；完全命中和上一轮缓存寿命继续遵循本篇。
 
+末位置的前向由[候选末位置按需计算](2026-10-15-defer-terminal-forward.md)补充：缓存保留完整累计分，KV 和隐藏状态在续跑经过末 token 时补齐；本篇的共享与失效约束继续成立。
+
 ## Alternatives considered
 
 - 移动旧状态：无需引用计数，但同一批其它候选可能仍要从这个状态续算，提前取走会破坏复用。
