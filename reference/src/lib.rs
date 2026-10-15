@@ -898,6 +898,9 @@ pub struct Reranker {
     /// one entry per candidate; keeping more would grow without a ceiling for reuse that was not
     /// measured to be there.
     resume: Vec<(Vec<u32>, Arc<TailRun>)>,
+    /// A spare vector whose allocation is reused while the previous decision remains available
+    /// for prefix matching.
+    resume_scratch: Vec<(Vec<u32>, Arc<TailRun>)>,
 }
 
 impl Reranker {
@@ -906,6 +909,7 @@ impl Reranker {
             model,
             cached: None,
             resume: Vec::new(),
+            resume_scratch: Vec::new(),
         }
     }
 
@@ -1004,12 +1008,16 @@ impl Reranker {
         if !matched {
             let prefix = self.model.run_prefix(&tokens);
             self.cached = Some((tokens, prefix));
-            // Every resume point hangs off the old prefix and means nothing against a new one.
-            self.resume.clear();
         }
         let (_, prefix) = self.cached.as_ref().expect("prefix was just computed");
         let capacity = indices.size_hint().0;
-        let mut next = Vec::with_capacity(capacity);
+        let mut previous =
+            std::mem::replace(&mut self.resume, std::mem::take(&mut self.resume_scratch));
+        self.resume.clear();
+        // Every resume point hangs off the old prefix and means nothing against a new one.
+        if !matched {
+            previous.clear();
+        }
         let mut scores = Vec::with_capacity(capacity);
         let limit = self
             .model
@@ -1024,22 +1032,22 @@ impl Reranker {
                 continue;
             }
             // 完全命中优先保留旧轮状态，再复用本轮已有结果；两组状态都供后续候选借用。
-            if let Some((_, run)) = self
-                .resume
+            if let Some((_, run)) = previous
                 .iter()
-                .chain(&next)
+                .chain(&self.resume)
                 .find(|(tokens, _)| tokens == &tail)
             {
                 let total = run.cumulative[tail.len() - 1];
                 scores.push(total / tail.len() as f32);
-                next.push((tail, Arc::clone(run)));
+                self.resume.push((tail, Arc::clone(run)));
                 continue;
             }
 
             // 选两轮的最长共享前缀；max_by_key 取最后一个同长项，旧轮顺序和优先级保持。
-            let shared = next
+            let shared = self
+                .resume
                 .iter()
-                .chain(&self.resume)
+                .chain(&previous)
                 .map(|(tokens, run)| {
                     let agreed = tokens
                         .iter()
@@ -1060,9 +1068,10 @@ impl Reranker {
             };
             let total = run.cumulative[run.cumulative.len() - 1];
             scores.push(total / tail.len() as f32);
-            next.push((tail, Arc::new(run)));
+            self.resume.push((tail, Arc::new(run)));
         }
-        self.resume = next;
+        previous.clear();
+        self.resume_scratch = previous;
         scores
     }
 }
@@ -1403,6 +1412,18 @@ mod tests {
             reranker.resume[0].0.as_ptr() as usize,
             "首次评分仍复制了编码 token 缓冲"
         );
+    }
+
+    #[test]
+    fn reranker_reuses_the_resume_buffer_capacity() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        reranker.log_probabilities("我", &["你好", "你吗"]);
+        reranker.log_probabilities("我", &["你好我", "你吗我"]);
+        let spare = reranker.resume_scratch.as_ptr();
+        assert!(reranker.resume_scratch.capacity() >= reranker.resume.len());
+        assert!(reranker.resume_scratch.capacity() >= 2);
+        reranker.log_probabilities("我", &["你好很", "你吗很"]);
+        assert_eq!(reranker.resume.as_ptr(), spare);
     }
 
     #[test]
