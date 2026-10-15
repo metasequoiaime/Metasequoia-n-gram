@@ -975,34 +975,38 @@ impl Reranker {
                 .max(1);
             let tail = &tail[..tail.len().min(limit)];
 
-            // 完全相同的 token 已有完整累计分，直接共享状态；保留旧轮供同批其它候选续算。
-            if let Some((_, run)) = self.resume.iter().find(|(tokens, _)| tokens == tail) {
+            // 完全命中优先保留旧轮状态，再复用本轮已有结果；两组状态都供后续候选借用。
+            if let Some((_, run)) = self
+                .resume
+                .iter()
+                .chain(&next)
+                .find(|(tokens, _)| tokens == tail)
+            {
                 let total = run.cumulative[tail.len() - 1];
                 scores.push(total / tail.len() as f32);
                 next.push((tail.to_vec(), Arc::clone(run)));
                 continue;
             }
 
-            // 非完全命中仍复用最长共享前缀，至少留一个 token 给续算路径。
-            let shared = self
-                .resume
+            // 选两轮的最长共享前缀；max_by_key 取最后一个同长项，旧轮顺序和优先级保持。
+            let shared = next
                 .iter()
-                .map(|(tokens, _)| {
+                .chain(&self.resume)
+                .map(|(tokens, run)| {
                     let agreed = tokens
                         .iter()
                         .zip(tail)
                         .take_while(|(left, right)| left == right)
                         .count();
-                    agreed.min(tail.len() - 1)
+                    (run, agreed.min(tail.len() - 1))
                 })
-                .enumerate()
                 .max_by_key(|(_, agreed)| *agreed);
 
             let run = match shared {
-                Some((index, agreed)) if agreed > 0 => {
-                    let (from, carried) = self.resume[index].1.resume(agreed, &self.model);
+                Some((previous, agreed)) if agreed > 0 => {
+                    let (from, carried) = previous.resume(agreed, &self.model);
                     let rest = self.model.run_tail(&from, &tail[agreed..]);
-                    self.resume[index].1.joined(agreed, carried, rest)
+                    previous.joined(agreed, carried, rest)
                 }
                 _ => self.model.run_tail(prefix, tail),
             };
@@ -1213,6 +1217,54 @@ mod tests {
     }
 
     #[test]
+    fn cold_batch_shares_forward_positions_and_completed_runs() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        let positions = || super::FORWARD_POSITIONS.with(std::cell::Cell::get);
+        let projections = || super::VOCABULARY_PROJECTIONS.with(std::cell::Cell::get);
+        let candidates = ["你好我", "你好很", "你好我", "你好我吗"];
+        for context in ["我", "很"] {
+            let before = (positions(), projections());
+            let scores = reranker.log_probabilities(context, &candidates);
+            assert_eq!(positions() - before.0, 5, "同批共享前缀仍重复前向");
+            assert_eq!(projections() - before.1, 4, "同批共享状态仍重复投影");
+            assert_eq!(scores[0].to_bits(), scores[2].to_bits());
+            assert!(std::sync::Arc::ptr_eq(
+                &reranker.resume[0].1,
+                &reranker.resume[2].1
+            ));
+            for (_, run) in &reranker.resume[1..] {
+                assert!(std::sync::Arc::ptr_eq(
+                    &reranker.resume[0].1.hidden[0],
+                    &run.hidden[0]
+                ));
+            }
+            let retained = std::sync::Arc::downgrade(&reranker.resume[0].1);
+            let before = positions();
+            reranker.log_probabilities(context, &["你好我吗", "你好我", "你好很"]);
+            assert_eq!(positions() - before, 0, "重排完全命中仍做前向");
+            reranker.log_probabilities(context, &[]);
+            assert!(retained.upgrade().is_none(), "本轮复用不应延长缓存寿命");
+        }
+    }
+
+    #[test]
+    fn same_length_reuse_keeps_the_previous_round_tie_order() {
+        let model = cache_test_model();
+        let mut reranker = super::Reranker::new(model.clone());
+        reranker.log_probabilities("我", &["你好", "你吗"]);
+        // 构造有效但独立的旧轮状态，让地址能区分同长匹配的来源。
+        let prefix = &reranker.cached.as_ref().unwrap().1;
+        for (tokens, run) in &mut reranker.resume {
+            *run = std::sync::Arc::new(model.run_tail(prefix, tokens));
+        }
+        let expected = reranker.resume[1].1.hidden[0].clone();
+        reranker.log_probabilities("我", &["你很", "你我"]);
+        for (_, run) in &reranker.resume {
+            assert!(std::sync::Arc::ptr_eq(&expected, &run.hidden[0]));
+        }
+    }
+
+    #[test]
     fn terminal_forward_waits_for_a_shared_continuation() {
         let mut reranker = super::Reranker::new(cache_test_model());
         let count = || super::FORWARD_POSITIONS.with(std::cell::Cell::get);
@@ -1220,8 +1272,8 @@ mod tests {
         reranker.log_probabilities("我", &["你好", "你吗"]);
         assert_eq!(
             count() - before,
-            4,
-            "上文和 BOS 加两个首字，候选末字无需前向"
+            3,
+            "上文和 BOS 加共享首字，候选末字无需前向"
         );
 
         let before = count();
@@ -1293,8 +1345,8 @@ mod tests {
         let count = || super::VOCABULARY_PROJECTIONS.with(std::cell::Cell::get);
         let before = count();
         reranker.log_probabilities("我", &["你好", "你吗"]);
-        // 上文投影一次，两条候选各自的首字状态各投影一次。
-        assert_eq!(count() - before, 3, "同一上文重复投影词表");
+        // 上文和同批共享的首字状态各投影一次。
+        assert_eq!(count() - before, 2, "同一上文或同批前缀重复投影词表");
 
         let before = count();
         reranker.log_probabilities("我", &["你好我", "你好很"]);
@@ -1306,7 +1358,7 @@ mod tests {
 
         let before = count();
         reranker.log_probabilities("很", &["你好", "你吗"]);
-        assert_eq!(count() - before, 3, "上下文改变后必须使用新状态");
+        assert_eq!(count() - before, 2, "上下文改变后必须使用新状态");
     }
 
     #[test]
