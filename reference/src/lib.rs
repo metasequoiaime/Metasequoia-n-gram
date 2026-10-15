@@ -116,6 +116,7 @@ std::thread_local! {
     static FORWARD_POSITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // 记录最近一次候选编码的缓冲地址，验证评分时直接转移所有权。
     static LAST_ENCODED_POINTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LAST_ENCODED_LENGTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -506,12 +507,20 @@ impl SentenceModel {
     }
 
     fn encode(&self, text: &str) -> Vec<u32> {
+        self.encode_limited(text, usize::MAX)
+    }
+
+    /// 模型不会评分窗口之后的 token，编码和保留容量都限制在这个窗口内。
+    fn encode_limited(&self, text: &str, limit: usize) -> Vec<u32> {
         let tokens: Vec<u32> = text
             .chars()
+            .take(limit)
             .map(|ch| self.index.get(&ch).copied().unwrap_or(UNK))
             .collect();
         #[cfg(test)]
         LAST_ENCODED_POINTER.with(|pointer| pointer.set(tokens.as_ptr() as usize));
+        #[cfg(test)]
+        LAST_ENCODED_LENGTH.with(|length| length.set(tokens.len()));
         tokens
     }
 
@@ -967,20 +976,18 @@ impl Reranker {
         let (_, prefix) = self.cached.as_ref().expect("prefix was just computed");
         let mut next = Vec::with_capacity(candidates.len());
         let mut scores = Vec::with_capacity(candidates.len());
+        let limit = self
+            .model
+            .config
+            .context
+            .saturating_sub(prefix.length)
+            .max(1);
         for text in candidates {
-            let mut tail = self.model.encode(text);
+            let tail = self.model.encode_limited(text, limit);
             if tail.is_empty() {
                 scores.push(f32::NEG_INFINITY);
                 continue;
             }
-            let limit = self
-                .model
-                .config
-                .context
-                .saturating_sub(prefix.length)
-                .max(1);
-            tail.truncate(limit);
-
             // 完全命中优先保留旧轮状态，再复用本轮已有结果；两组状态都供后续候选借用。
             if let Some((_, run)) = self
                 .resume
@@ -1174,6 +1181,8 @@ fn erf(x: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    mod bounded_encoding;
+
     use super::{comparable, erf, gelu, should_rerank, CandidateFacts};
 
     // 一层小模型只使用合成权重，缓存测试不读取外部模型文件。
@@ -1370,6 +1379,25 @@ mod tests {
             reranker.resume[0].0.as_ptr() as usize,
             "复用候选仍复制了编码 token 缓冲"
         );
+    }
+
+    #[test]
+    fn overlong_candidates_keep_only_the_model_window() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        for text in ["你", "A", "🎹"].map(|unit| unit.repeat(65_536)) {
+            for _ in 0..2 {
+                reranker.log_probabilities("我", &[&text]);
+                let window = reranker.model.config.context - 1;
+                assert_eq!(reranker.resume[0].0.len(), window);
+                assert!(
+                    reranker.resume[0].0.capacity() <= 2 * window,
+                    "候选缓存仍保留窗口之外的编码容量：{}",
+                    reranker.resume[0].0.capacity()
+                );
+                let encoded = super::LAST_ENCODED_LENGTH.with(std::cell::Cell::get);
+                assert_eq!(encoded, window, "仍编码了不会参与评分的尾部");
+            }
+        }
     }
 
     #[test]
