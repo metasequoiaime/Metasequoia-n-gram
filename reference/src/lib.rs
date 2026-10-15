@@ -114,6 +114,8 @@ const BOS: u32 = 2;
 #[cfg(test)]
 std::thread_local! {
     static FORWARD_POSITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // 记录最近一次候选编码的缓冲地址，验证评分时直接转移所有权。
+    static LAST_ENCODED_POINTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -504,9 +506,13 @@ impl SentenceModel {
     }
 
     fn encode(&self, text: &str) -> Vec<u32> {
-        text.chars()
+        let tokens: Vec<u32> = text
+            .chars()
             .map(|ch| self.index.get(&ch).copied().unwrap_or(UNK))
-            .collect()
+            .collect();
+        #[cfg(test)]
+        LAST_ENCODED_POINTER.with(|pointer| pointer.set(tokens.as_ptr() as usize));
+        tokens
     }
 
     /// Mean log-probability per character of each candidate, conditioned on the committed text.
@@ -962,7 +968,7 @@ impl Reranker {
         let mut next = Vec::with_capacity(candidates.len());
         let mut scores = Vec::with_capacity(candidates.len());
         for text in candidates {
-            let tail = self.model.encode(text);
+            let mut tail = self.model.encode(text);
             if tail.is_empty() {
                 scores.push(f32::NEG_INFINITY);
                 continue;
@@ -973,18 +979,18 @@ impl Reranker {
                 .context
                 .saturating_sub(prefix.length)
                 .max(1);
-            let tail = &tail[..tail.len().min(limit)];
+            tail.truncate(limit);
 
             // 完全命中优先保留旧轮状态，再复用本轮已有结果；两组状态都供后续候选借用。
             if let Some((_, run)) = self
                 .resume
                 .iter()
                 .chain(&next)
-                .find(|(tokens, _)| tokens == tail)
+                .find(|(tokens, _)| tokens == &tail)
             {
                 let total = run.cumulative[tail.len() - 1];
                 scores.push(total / tail.len() as f32);
-                next.push((tail.to_vec(), Arc::clone(run)));
+                next.push((tail, Arc::clone(run)));
                 continue;
             }
 
@@ -995,7 +1001,7 @@ impl Reranker {
                 .map(|(tokens, run)| {
                     let agreed = tokens
                         .iter()
-                        .zip(tail)
+                        .zip(&tail)
                         .take_while(|(left, right)| left == right)
                         .count();
                     (run, agreed.min(tail.len() - 1))
@@ -1008,11 +1014,11 @@ impl Reranker {
                     let rest = self.model.run_tail(&from, &tail[agreed..]);
                     previous.joined(agreed, carried, rest)
                 }
-                _ => self.model.run_tail(prefix, tail),
+                _ => self.model.run_tail(prefix, &tail),
             };
             let total = run.cumulative[run.cumulative.len() - 1];
             scores.push(total / tail.len() as f32);
-            next.push((tail.to_vec(), Arc::new(run)));
+            next.push((tail, Arc::new(run)));
         }
         self.resume = next;
         scores
@@ -1337,6 +1343,33 @@ mod tests {
         reranker.log_probabilities("我", &[]);
         assert!(reranker.resume.is_empty());
         assert!(retained.upgrade().is_none());
+    }
+
+    #[test]
+    fn fresh_score_moves_encoded_tail_without_copying_it() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        super::LAST_ENCODED_POINTER.with(|pointer| pointer.set(0));
+        reranker.log_probabilities("我", &["你好"]);
+        let encoded = super::LAST_ENCODED_POINTER.with(std::cell::Cell::get);
+        assert_eq!(
+            encoded,
+            reranker.resume[0].0.as_ptr() as usize,
+            "首次评分仍复制了编码 token 缓冲"
+        );
+    }
+
+    #[test]
+    fn exact_reuse_moves_encoded_tail_without_copying_it() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        reranker.log_probabilities("我", &["你好"]);
+        super::LAST_ENCODED_POINTER.with(|pointer| pointer.set(0));
+        reranker.log_probabilities("我", &["你好"]);
+        let encoded = super::LAST_ENCODED_POINTER.with(std::cell::Cell::get);
+        assert_eq!(
+            encoded,
+            reranker.resume[0].0.as_ptr() as usize,
+            "复用候选仍复制了编码 token 缓冲"
+        );
     }
 
     #[test]
