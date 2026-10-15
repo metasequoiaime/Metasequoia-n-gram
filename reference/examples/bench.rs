@@ -22,7 +22,8 @@
 
 use std::time::{Duration, Instant};
 
-use chinese_ime_lm::SentenceModel;
+use chinese_ime_lm::{Reranker, SentenceModel};
+use std::sync::Arc;
 
 /// Candidate counts worth measuring. One is the floor — a host that reranks a single candidate is
 /// paying the model to confirm the only answer — and nine is a full candidate page.
@@ -154,7 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let started = Instant::now();
     let bytes = std::fs::read(path)?;
-    let model = SentenceModel::load(&bytes)?;
+    let model = Arc::new(SentenceModel::load(&bytes)?);
     println!(
         "load {:?} for {:.1} MB",
         started.elapsed(),
@@ -196,6 +197,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "some cells repeated candidates: the pool has too few sentences that long. Cost depends\non the shape of the request, so the timings hold, but the text in those cells is not 9 distinct\nsentences."
         );
+    }
+
+    // 同一批候选跨按键保持不变，单独测量会话缓存命中；冷计算表继续保留。
+    println!(
+        "\nunchanged decision with a warm Reranker, milliseconds (p50 / p95 over {RUNS} runs):"
+    );
+    print!("{:>12}", "chars:");
+    for length in LENGTHS {
+        print!("{length:>14}");
+    }
+    println!();
+    for count in COUNTS {
+        print!("{count:>10} cand");
+        for length in LENGTHS {
+            let (texts, _) = candidates(&pool, count, length);
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let mut reranker = Reranker::new(model.clone());
+            reranker.log_probabilities("", &refs);
+            let mut samples = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let started = Instant::now();
+                let _ = reranker.log_probabilities("", &refs);
+                samples.push(ms(started.elapsed()));
+            }
+            samples.sort_by(|a, b| a.total_cmp(b));
+            print!(
+                "{:>7.3} /{:>6.3}",
+                percentile(&samples, 50.0),
+                percentile(&samples, 95.0)
+            );
+        }
+        println!();
     }
 
     // What a host actually pays. Typing an n-character sentence does not cost one decision at

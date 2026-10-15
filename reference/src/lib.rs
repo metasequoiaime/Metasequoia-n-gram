@@ -732,7 +732,7 @@ pub struct Reranker {
     /// something the previous keystroke scored. Keeping only the previous decision bounds this to
     /// one entry per candidate; keeping more would grow without a ceiling for reuse that was not
     /// measured to be there.
-    resume: Vec<(Vec<u32>, TailRun)>,
+    resume: Vec<(Vec<u32>, Arc<TailRun>)>,
 }
 
 impl Reranker {
@@ -853,9 +853,15 @@ impl Reranker {
                 .max(1);
             let tail = &tail[..tail.len().min(limit)];
 
-            // How far this candidate agrees with the furthest-agreeing run from last time. One
-            // short of `tail.len()` at most: a resume has to leave a token to run, both because
-            // the run needs one and because a candidate with nothing left to score has no term.
+            // 完全相同的 token 已有完整累计分，直接共享状态；保留旧轮供同批其它候选续算。
+            if let Some((_, run)) = self.resume.iter().find(|(tokens, _)| tokens == tail) {
+                let total = run.cumulative[tail.len() - 1];
+                scores.push(total / tail.len() as f32);
+                next.push((tail.to_vec(), Arc::clone(run)));
+                continue;
+            }
+
+            // 非完全命中仍复用最长共享前缀，至少留一个 token 给续算路径。
             let shared = self
                 .resume
                 .iter()
@@ -880,7 +886,7 @@ impl Reranker {
             };
             let total = run.cumulative[run.cumulative.len() - 1];
             scores.push(total / tail.len() as f32);
-            next.push((tail.to_vec(), run));
+            next.push((tail.to_vec(), Arc::new(run)));
         }
         self.resume = next;
         scores
@@ -1037,6 +1043,85 @@ fn erf(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{comparable, erf, gelu, should_rerank, CandidateFacts};
+
+    // 一层小模型只使用合成权重，缓存测试不读取外部模型文件。
+    fn cache_test_model() -> std::sync::Arc<super::SentenceModel> {
+        use super::{Block, Config, Matrix, SentenceModel};
+        let matrix = |size| Matrix {
+            inner: super::Tensor::Float(vec![0.125; size]),
+        };
+        std::sync::Arc::new(SentenceModel {
+            config: Config {
+                vocab: 8,
+                n_layer: 1,
+                n_head: 2,
+                n_embd: 4,
+                context: 8,
+            },
+            index: ['你', '好', '吗', '我', '很']
+                .into_iter()
+                .enumerate()
+                .map(|(index, character)| (character, index as u32 + 3))
+                .collect(),
+            token: matrix(8 * 4),
+            position: vec![0.0; 8 * 4],
+            blocks: vec![Block {
+                ln1_weight: vec![1.0; 4],
+                ln1_bias: vec![0.0; 4],
+                qkv_weight: matrix(12 * 4),
+                qkv_bias: vec![0.0; 12],
+                proj_weight: matrix(4 * 4),
+                proj_bias: vec![0.0; 4],
+                ln2_weight: vec![1.0; 4],
+                ln2_bias: vec![0.0; 4],
+                fc_weight: matrix(16 * 4),
+                fc_bias: vec![0.0; 16],
+                out_weight: matrix(4 * 16),
+                out_bias: vec![0.0; 4],
+            }],
+            final_weight: vec![1.0; 4],
+            final_bias: vec![0.0; 4],
+            attribution: String::new(),
+            license: String::new(),
+        })
+    }
+
+    #[test]
+    fn identical_candidates_keep_the_completed_run() {
+        let mut reranker = super::Reranker::new(cache_test_model());
+        let before = reranker.log_probabilities("我", &["你好", "你吗"]);
+        let retained = std::sync::Arc::downgrade(&reranker.resume[0].1);
+        let allocation = reranker.resume[0].1.cumulative.as_ptr();
+        let hidden = reranker.resume[0].1.hidden[1].as_ptr();
+        // 重排、增删和重复候选不能消耗其它候选还要借用的旧状态。
+        let after = reranker.log_probabilities("我", &["你吗我", "你好", "你好"]);
+        assert_eq!(before[0].to_bits(), after[1].to_bits());
+        assert_eq!(after[1].to_bits(), after[2].to_bits());
+        for index in [1, 2] {
+            assert_eq!(
+                allocation,
+                reranker.resume[index].1.cumulative.as_ptr(),
+                "完全命中仍重新创建了累计分"
+            );
+            assert_eq!(
+                hidden,
+                reranker.resume[index].1.hidden[1].as_ptr(),
+                "完全命中仍重新计算或复制了隐藏状态"
+            );
+        }
+        assert_eq!(reranker.resume.len(), 3);
+        reranker.log_probabilities("我", &["你好"]);
+        assert_eq!(reranker.resume.len(), 1);
+        reranker.log_probabilities("我", &[]);
+        assert!(reranker.resume.is_empty());
+        assert!(retained.upgrade().is_none());
+    }
+
+    #[test]
+    fn reranker_remains_send_and_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<super::Reranker>();
+    }
 
     /// `answers_key` per candidate, with no candidate an exact dictionary hit.
     fn answering(flags: &[bool]) -> impl Fn(usize) -> CandidateFacts + '_ {
