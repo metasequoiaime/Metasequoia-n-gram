@@ -274,6 +274,30 @@ fn warmed_feed_forward_keeps_both_buffers() {
 }
 
 #[test]
+fn attention_projection_reuses_normalized_buffer() {
+    let mut model = model(8, 3, true);
+    model.blocks[0].proj_weight = matrix(8, 8, true, 13);
+    model.blocks[0].proj_bias = vec![0.0; 8];
+    let attended = input(8, 4);
+    let mut scratch = FeedForwardScratch::default();
+    scratch.normalized.resize(attended.len(), 0.0);
+    let pointer = scratch.normalized.as_ptr();
+    model.project_attention_into(&attended, &model.blocks[0], &mut scratch);
+    let expected = reference_linear(
+        &attended,
+        &model.blocks[0].proj_weight,
+        &model.blocks[0].proj_bias,
+        8,
+        8,
+    );
+    assert_eq!(bits(&scratch.normalized), bits(&expected));
+    assert!(
+        pointer == scratch.normalized.as_ptr(),
+        "attention projection should reuse feed-forward scratch"
+    );
+}
+
+#[test]
 fn complete_feed_forward_matches_legacy_bits() {
     for quantized in [false, true] {
         for width in [1, 7, 8, 9, 192, 768] {
