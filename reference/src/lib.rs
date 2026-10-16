@@ -184,6 +184,12 @@ struct Block {
     out_bias: Vec<f32>,
 }
 
+#[derive(Default)]
+struct FeedForwardScratch {
+    normalized: Vec<f32>,
+    hidden: Vec<f32>,
+}
+
 pub struct SentenceModel {
     config: Config,
     index: HashMap<char, u32>,
@@ -628,6 +634,7 @@ impl SentenceModel {
     fn run_prefix(&self, tokens: &[u32]) -> Prefix<'static> {
         let n_embd = self.config.n_embd;
         let mut x = self.embed(tokens, 0);
+        let mut feed_forward = FeedForwardScratch::default();
         let mut keys = Vec::with_capacity(self.blocks.len());
         let mut values = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
@@ -651,7 +658,7 @@ impl SentenceModel {
             for (slot, value) in x.iter_mut().zip(projected) {
                 *slot += value;
             }
-            self.feed_forward(&mut x, block);
+            self.feed_forward(&mut x, block, &mut feed_forward);
             keys.push(k);
             values.push(v);
         }
@@ -729,6 +736,7 @@ impl SentenceModel {
         }
         let n_embd = self.config.n_embd;
         let mut x = self.embed(tokens, length);
+        let mut feed_forward = FeedForwardScratch::default();
         let mut keys_out = Vec::with_capacity(self.blocks.len());
         let mut values_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
@@ -758,7 +766,7 @@ impl SentenceModel {
             for (slot, value) in x.iter_mut().zip(projected) {
                 *slot += value;
             }
-            self.feed_forward(&mut x, block);
+            self.feed_forward(&mut x, block, &mut feed_forward);
             keys_out.push(keys);
             values_out.push(values);
         }
@@ -774,27 +782,38 @@ impl SentenceModel {
         }
     }
 
-    fn feed_forward(&self, x: &mut [f32], block: &Block) {
+    fn feed_forward(&self, x: &mut [f32], block: &Block, scratch: &mut FeedForwardScratch) {
         let n_embd = self.config.n_embd;
-        let normed = layer_norm(x, &block.ln2_weight, &block.ln2_bias, n_embd);
-        let mut hidden = linear(
-            &normed,
+        scratch.normalized.resize(x.len(), 0.0);
+        layer_norm_into(
+            x,
+            &block.ln2_weight,
+            &block.ln2_bias,
+            n_embd,
+            &mut scratch.normalized,
+        );
+        scratch.hidden.resize(x.len() * 4, 0.0);
+        linear_into(
+            &scratch.normalized,
             &block.fc_weight,
             &block.fc_bias,
             n_embd,
             4 * n_embd,
+            &mut scratch.hidden,
         );
-        for value in &mut hidden {
+        for value in &mut scratch.hidden {
             *value = gelu(*value);
         }
-        let out = linear(
-            &hidden,
+        // 第一线性层已消费归一化结果，输出投影可以覆盖同一份存储。
+        linear_into(
+            &scratch.hidden,
             &block.out_weight,
             &block.out_bias,
             4 * n_embd,
             n_embd,
+            &mut scratch.normalized,
         );
-        for (slot, value) in x.iter_mut().zip(out) {
+        for (slot, &value) in x.iter_mut().zip(&scratch.normalized) {
             *slot += value;
         }
     }
@@ -1192,8 +1211,20 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// `out[m][o] = dot(x[m], w[o]) + bias[o]`, with both operands laid out row-major so every dot
 /// product runs over contiguous memory.
 fn linear(x: &[f32], w: &Matrix, bias: &[f32], inputs: usize, outputs: usize) -> Vec<f32> {
+    let mut out = vec![0.0; x.len() / inputs * outputs];
+    linear_into(x, w, bias, inputs, outputs, &mut out);
+    out
+}
+
+fn linear_into(
+    x: &[f32],
+    w: &Matrix,
+    bias: &[f32],
+    inputs: usize,
+    outputs: usize,
+    out: &mut [f32],
+) {
     let rows = x.len() / inputs;
-    let mut out = vec![0.0; rows * outputs];
     for row in 0..rows {
         let source = &x[row * inputs..(row + 1) * inputs];
         let target = &mut out[row * outputs..(row + 1) * outputs];
@@ -1201,7 +1232,6 @@ fn linear(x: &[f32], w: &Matrix, bias: &[f32], inputs: usize, outputs: usize) ->
             *slot = w.dot_row(source, index, inputs) + bias[index];
         }
     }
-    out
 }
 
 /// The quantized counterpart of `dot`, with the same eight independent accumulators and the same
@@ -1227,6 +1257,11 @@ fn dot_i8(a: &[f32], b: &[i8]) -> f32 {
 
 fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], width: usize) -> Vec<f32> {
     let mut out = vec![0.0; x.len()];
+    layer_norm_into(x, weight, bias, width, &mut out);
+    out
+}
+
+fn layer_norm_into(x: &[f32], weight: &[f32], bias: &[f32], width: usize, out: &mut [f32]) {
     for (source, target) in x.chunks_exact(width).zip(out.chunks_exact_mut(width)) {
         let mean = source.iter().sum::<f32>() / width as f32;
         let variance = source
@@ -1239,7 +1274,6 @@ fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], width: usize) -> Vec<f32>
             *slot = (source[index] - mean) * inverse * weight[index] + bias[index];
         }
     }
-    out
 }
 
 /// 按最终大小拆分，新增 K、V 直接写入已有可见前缀之后。
@@ -1820,3 +1854,6 @@ mod tests {
         assert!((gelu(2.0) - 1.954_499_7).abs() < 1e-6);
     }
 }
+
+#[cfg(test)]
+mod feed_forward_scratch_tests;
