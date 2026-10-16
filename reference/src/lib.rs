@@ -650,14 +650,8 @@ impl SentenceModel {
             };
             let start = first * n_embd;
             let attended = self.attention(&q[start..], &k, &v, tokens.len() - first, first);
-            let projected = linear(
-                &attended,
-                &block.proj_weight,
-                &block.proj_bias,
-                n_embd,
-                n_embd,
-            );
-            for (slot, value) in x[start..].iter_mut().zip(projected) {
+            self.project_attention_into(&attended, block, &mut feed_forward);
+            for (slot, &value) in x[start..].iter_mut().zip(&feed_forward.normalized) {
                 *slot += value;
             }
             self.feed_forward(&mut x[start..], block, &mut feed_forward);
@@ -769,14 +763,8 @@ impl SentenceModel {
                 terminal.map(|last| (last.keys[layer].as_slice(), last.values[layer].as_slice())),
             );
             let attended = self.attention(&q, &keys, &values, tokens.len(), length);
-            let projected = linear(
-                &attended,
-                &block.proj_weight,
-                &block.proj_bias,
-                n_embd,
-                n_embd,
-            );
-            for (slot, value) in x.iter_mut().zip(projected) {
+            self.project_attention_into(&attended, block, &mut feed_forward);
+            for (slot, &value) in x.iter_mut().zip(&feed_forward.normalized) {
                 *slot += value;
             }
             self.feed_forward(&mut x, block, &mut feed_forward);
@@ -793,6 +781,23 @@ impl SentenceModel {
                 .map(|row| Arc::new(HiddenState::new(row.to_vec())))
                 .collect(),
         }
+    }
+
+    fn project_attention_into(
+        &self,
+        attended: &[f32],
+        block: &Block,
+        scratch: &mut FeedForwardScratch,
+    ) {
+        scratch.normalized.resize(attended.len(), 0.0);
+        linear_into(
+            attended,
+            &block.proj_weight,
+            &block.proj_bias,
+            self.config.n_embd,
+            self.config.n_embd,
+            &mut scratch.normalized,
+        );
     }
 
     fn feed_forward(&self, x: &mut [f32], block: &Block, scratch: &mut FeedForwardScratch) {
