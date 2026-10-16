@@ -298,6 +298,24 @@ fn attention_projection_reuses_normalized_buffer() {
 }
 
 #[test]
+fn attention_layer_norm_reuses_normalized_buffer() {
+    let model = model(8, 3, true);
+    let x = input(8, 4);
+    let mut scratch = FeedForwardScratch::default();
+    scratch.normalized.resize(x.len(), 0.0);
+    let pointer = scratch.normalized.as_ptr();
+    model.normalize_attention_into(&x, &model.blocks[0], &mut scratch);
+    let expected = reference_layer_norm(
+        &x,
+        &model.blocks[0].ln1_weight,
+        &model.blocks[0].ln1_bias,
+        8,
+    );
+    assert_eq!(bits(&scratch.normalized), bits(&expected));
+    assert_eq!(pointer, scratch.normalized.as_ptr());
+}
+
+#[test]
 fn complete_feed_forward_matches_legacy_bits() {
     for quantized in [false, true] {
         for width in [1, 7, 8, 9, 192, 768] {
@@ -386,6 +404,98 @@ fn new_chain(model: &SentenceModel, x: &[f32]) -> Vec<f32> {
 }
 
 type Chain = fn(&SentenceModel, &[f32]) -> Vec<f32>;
+
+#[inline(never)]
+fn old_layer_norm_chain(model: &SentenceModel, x: &[f32]) -> Vec<f32> {
+    let mut x = x.to_vec();
+    for block in &model.blocks {
+        x = reference_layer_norm(&x, &block.ln1_weight, &block.ln1_bias, model.config.n_embd);
+    }
+    x
+}
+
+#[inline(never)]
+fn new_layer_norm_chain(model: &SentenceModel, x: &[f32]) -> Vec<f32> {
+    let mut x = x.to_vec();
+    let mut scratch = FeedForwardScratch::default();
+    for block in &model.blocks {
+        model.normalize_attention_into(&x, block, &mut scratch);
+        std::mem::swap(&mut x, &mut scratch.normalized);
+    }
+    x
+}
+
+type LayerNormChain = fn(&SentenceModel, &[f32]) -> Vec<f32>;
+
+fn elapsed_layer_norm(
+    chain: LayerNormChain,
+    model: &SentenceModel,
+    x: &[f32],
+    repeats: usize,
+) -> f64 {
+    let start = Instant::now();
+    for _ in 0..repeats {
+        drop(black_box(chain(black_box(model), black_box(x))));
+    }
+    start.elapsed().as_secs_f64()
+}
+
+#[test]
+#[ignore = "独占运行六层 attention 前置归一化配对预算"]
+fn six_layer_attention_layer_norm_paired_budget() {
+    let mut failures = Vec::new();
+    for quantized in [true, false] {
+        for width in [192, 768] {
+            let model = model(width, 6, quantized);
+            for rows in [1, 4, 12] {
+                let x = input(width, rows);
+                assert_eq!(
+                    bits(&old_layer_norm_chain(&model, &x)),
+                    bits(&new_layer_norm_chain(&model, &x))
+                );
+                let mut repeats = 1;
+                while elapsed_layer_norm(old_layer_norm_chain, &model, &x, repeats) < 0.010 {
+                    repeats *= 2;
+                }
+                let mut ratios = Vec::new();
+                for pair in 0..40 {
+                    let (old, new) = if pair % 2 == 0 {
+                        let old = elapsed_layer_norm(old_layer_norm_chain, &model, &x, repeats);
+                        (
+                            old,
+                            elapsed_layer_norm(new_layer_norm_chain, &model, &x, repeats),
+                        )
+                    } else {
+                        let new = elapsed_layer_norm(new_layer_norm_chain, &model, &x, repeats);
+                        (
+                            elapsed_layer_norm(old_layer_norm_chain, &model, &x, repeats),
+                            new,
+                        )
+                    };
+                    ratios.push(new / old);
+                }
+                ratios.sort_by(f64::total_cmp);
+                let ratio = ratios[19];
+                let budget = if quantized && width == 192 && rows == 1 {
+                    0.99
+                } else {
+                    1.03
+                };
+                println!(
+                    "quantized={quantized} width={width} rows={rows} repeats={repeats} paired_ratio_p50={ratio:.4} budget={budget:.2}"
+                );
+                if ratio >= budget {
+                    failures.push((quantized, width, rows, ratio, budget));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "paired layer norm budget failures: {failures:?}"
+    );
+}
+
 fn elapsed(chain: Chain, model: &SentenceModel, x: &[f32], repeats: usize) -> f64 {
     let start = Instant::now();
     for _ in 0..repeats {

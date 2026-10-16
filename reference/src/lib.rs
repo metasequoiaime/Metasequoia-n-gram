@@ -633,9 +633,9 @@ impl SentenceModel {
         let mut keys = Vec::with_capacity(self.blocks.len());
         let mut values = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
-            let normed = layer_norm(&x, &block.ln1_weight, &block.ln1_bias, n_embd);
+            self.normalize_attention_into(&x, block, &mut feed_forward);
             let qkv = linear(
-                &normed,
+                &feed_forward.normalized,
                 &block.qkv_weight,
                 &block.qkv_bias,
                 n_embd,
@@ -659,12 +659,15 @@ impl SentenceModel {
             values.push(v);
         }
         let last = (tokens.len() - 1) * n_embd;
-        let last_hidden = Arc::new(HiddenState::new(layer_norm(
+        feed_forward.normalized.resize(n_embd, 0.0);
+        layer_norm_into(
             &x[last..],
             &self.final_weight,
             &self.final_bias,
             n_embd,
-        )));
+            &mut feed_forward.normalized,
+        );
+        let last_hidden = Arc::new(HiddenState::new(feed_forward.normalized));
         Prefix {
             length: tokens.len(),
             keys: Cow::Owned(keys),
@@ -746,9 +749,9 @@ impl SentenceModel {
         let mut keys_out = Vec::with_capacity(self.blocks.len());
         let mut values_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
-            let normed = layer_norm(&x, &block.ln1_weight, &block.ln1_bias, n_embd);
+            self.normalize_attention_into(&x, block, &mut feed_forward);
             let qkv = linear(
-                &normed,
+                &feed_forward.normalized,
                 &block.qkv_weight,
                 &block.qkv_bias,
                 n_embd,
@@ -771,12 +774,20 @@ impl SentenceModel {
             keys_out.push(keys);
             values_out.push(values);
         }
-        let normed = layer_norm(&x, &self.final_weight, &self.final_bias, n_embd);
+        feed_forward.normalized.resize(x.len(), 0.0);
+        layer_norm_into(
+            &x,
+            &self.final_weight,
+            &self.final_bias,
+            n_embd,
+            &mut feed_forward.normalized,
+        );
 
         TailStates {
             keys: keys_out,
             values: values_out,
-            hidden: normed
+            hidden: feed_forward
+                .normalized
                 .chunks_exact(n_embd)
                 .map(|row| Arc::new(HiddenState::new(row.to_vec())))
                 .collect(),
@@ -795,6 +806,17 @@ impl SentenceModel {
             &block.proj_weight,
             &block.proj_bias,
             self.config.n_embd,
+            self.config.n_embd,
+            &mut scratch.normalized,
+        );
+    }
+
+    fn normalize_attention_into(&self, x: &[f32], block: &Block, scratch: &mut FeedForwardScratch) {
+        scratch.normalized.resize(x.len(), 0.0);
+        layer_norm_into(
+            x,
+            &block.ln1_weight,
+            &block.ln1_bias,
             self.config.n_embd,
             &mut scratch.normalized,
         );
@@ -1275,6 +1297,7 @@ fn dot_i8(a: &[f32], b: &[i8]) -> f32 {
     total
 }
 
+#[cfg(test)]
 fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], width: usize) -> Vec<f32> {
     let mut out = vec![0.0; x.len()];
     layer_norm_into(x, weight, bias, width, &mut out);
