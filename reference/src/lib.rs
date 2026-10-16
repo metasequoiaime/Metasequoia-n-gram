@@ -185,6 +185,12 @@ struct Block {
 }
 
 #[derive(Default)]
+struct AttentionScratch {
+    output: Vec<f32>,
+    scores: Vec<f32>,
+}
+
+#[derive(Default)]
 struct FeedForwardScratch {
     normalized: Vec<f32>,
     hidden: Vec<f32>,
@@ -635,6 +641,7 @@ impl SentenceModel {
         let n_embd = self.config.n_embd;
         let mut x = self.embed(tokens, 0);
         let mut feed_forward = FeedForwardScratch::default();
+        let mut attention = AttentionScratch::default();
         let mut keys = Vec::with_capacity(self.blocks.len());
         let mut values = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
@@ -647,9 +654,9 @@ impl SentenceModel {
                 3 * n_embd,
             );
             let (q, k, v) = split_qkv(&qkv, tokens.len(), n_embd, &[], &[]);
-            let attended = self.attention(&q, &k, &v, tokens.len(), 0);
+            self.attention_into(&q, &k, &v, tokens.len(), 0, &mut attention);
             let projected = linear(
-                &attended,
+                &attention.output,
                 &block.proj_weight,
                 &block.proj_bias,
                 n_embd,
@@ -737,6 +744,7 @@ impl SentenceModel {
         let n_embd = self.config.n_embd;
         let mut x = self.embed(tokens, length);
         let mut feed_forward = FeedForwardScratch::default();
+        let mut attention = AttentionScratch::default();
         let mut keys_out = Vec::with_capacity(self.blocks.len());
         let mut values_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
@@ -755,9 +763,9 @@ impl SentenceModel {
                 &prefix_keys[layer][..prefix_width],
                 &prefix_values[layer][..prefix_width],
             );
-            let attended = self.attention(&q, &keys, &values, tokens.len(), length);
+            self.attention_into(&q, &keys, &values, tokens.len(), length, &mut attention);
             let projected = linear(
-                &attended,
+                &attention.output,
                 &block.proj_weight,
                 &block.proj_bias,
                 n_embd,
@@ -889,16 +897,27 @@ impl SentenceModel {
         self.index.get(&character).copied()
     }
 
-    fn attention(&self, q: &[f32], k: &[f32], v: &[f32], rows: usize, offset: usize) -> Vec<f32> {
+    fn attention_into(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        rows: usize,
+        offset: usize,
+        scratch: &mut AttentionScratch,
+    ) {
         let n_embd = self.config.n_embd;
         let heads = self.config.n_head;
         let width = n_embd / heads;
         let scale = 1.0 / (width as f32).sqrt();
         let total = k.len() / n_embd;
-        let mut out = vec![0.0; rows * n_embd];
-        let mut scores = vec![0.0; total];
+        scratch.output.resize(rows * n_embd, 0.0);
+        scratch.output.fill(0.0);
+        scratch.scores.resize(total, 0.0);
+        let out = &mut scratch.output;
+        let scores = &mut scratch.scores;
         for row in 0..rows {
-            // Causal: a query at absolute position `offset + row` may attend to itself and earlier.
+            // 查询只能看到绝对位置 offset + row 及之前的位置。
             let visible = offset + row + 1;
             for head in 0..heads {
                 let base = head * width;
@@ -924,7 +943,6 @@ impl SentenceModel {
                 }
             }
         }
-        out
     }
 }
 
@@ -1857,3 +1875,6 @@ mod tests {
 
 #[cfg(test)]
 mod feed_forward_scratch_tests;
+
+#[cfg(test)]
+mod attention_scratch_tests;
