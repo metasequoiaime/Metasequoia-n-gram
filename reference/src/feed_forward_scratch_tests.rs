@@ -79,8 +79,7 @@ fn reference_run_prefix(model: &SentenceModel, tokens: &[u32]) -> Prefix<'static
             3 * n_embd,
         );
         let (q, k, v) = split_qkv(&qkv, tokens.len(), n_embd, &[], &[]);
-        let attended =
-            super::attention_scratch_tests::reference_attention(model, &q, &k, &v, tokens.len(), 0);
+        let attended = model.attention(&q, &k, &v, tokens.len(), 0);
         let projected = reference_linear(
             &attended,
             &block.proj_weight,
@@ -152,14 +151,7 @@ fn reference_run_tail_states(
             &prefix_keys[layer][..prefix_width],
             &prefix_values[layer][..prefix_width],
         );
-        let attended = super::attention_scratch_tests::reference_attention(
-            model,
-            &q,
-            &keys,
-            &values,
-            tokens.len(),
-            length,
-        );
+        let attended = model.attention(&q, &keys, &values, tokens.len(), length);
         let projected = reference_linear(
             &attended,
             &block.proj_weight,
@@ -204,7 +196,7 @@ fn matrix(rows: usize, width: usize, quantized: bool, salt: usize) -> Matrix {
     }
 }
 
-pub(super) fn model(width: usize, layers: usize, quantized: bool) -> SentenceModel {
+fn model(width: usize, layers: usize, quantized: bool) -> SentenceModel {
     let vector = |count, salt| {
         (0..count)
             .map(|i| (((i * 3 + salt) % 19) as f32 - 9.0) / 32.0)
