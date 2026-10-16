@@ -16,7 +16,8 @@ mod weights;
 
 #[cfg(test)]
 thread_local! {
-    // 只统计当前测试线程实际执行的完整词表投影，不改变生产接口。
+    // 只统计当前测试线程实际执行的查询位置和词表投影，不改变生产接口。
+    static ATTENTION_POSITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static VOCABULARY_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -637,7 +638,7 @@ impl SentenceModel {
         let mut feed_forward = FeedForwardScratch::default();
         let mut keys = Vec::with_capacity(self.blocks.len());
         let mut values = Vec::with_capacity(self.blocks.len());
-        for block in &self.blocks {
+        for (layer, block) in self.blocks.iter().enumerate() {
             let normed = layer_norm(&x, &block.ln1_weight, &block.ln1_bias, n_embd);
             let qkv = linear(
                 &normed,
@@ -647,7 +648,14 @@ impl SentenceModel {
                 3 * n_embd,
             );
             let (q, k, v) = split_qkv(&qkv, tokens.len(), n_embd, &[], &[]);
-            let attended = self.attention(&q, &k, &v, tokens.len(), 0);
+            // 最后一层只消费末位置输出；所有位置的 KV 仍供后续候选使用。
+            let first = if layer + 1 == self.blocks.len() {
+                tokens.len() - 1
+            } else {
+                0
+            };
+            let start = first * n_embd;
+            let attended = self.attention(&q[start..], &k, &v, tokens.len() - first, first);
             let projected = linear(
                 &attended,
                 &block.proj_weight,
@@ -655,10 +663,10 @@ impl SentenceModel {
                 n_embd,
                 n_embd,
             );
-            for (slot, value) in x.iter_mut().zip(projected) {
+            for (slot, value) in x[start..].iter_mut().zip(projected) {
                 *slot += value;
             }
-            self.feed_forward(&mut x, block, &mut feed_forward);
+            self.feed_forward(&mut x[start..], block, &mut feed_forward);
             keys.push(k);
             values.push(v);
         }
@@ -890,6 +898,8 @@ impl SentenceModel {
     }
 
     fn attention(&self, q: &[f32], k: &[f32], v: &[f32], rows: usize, offset: usize) -> Vec<f32> {
+        #[cfg(test)]
+        ATTENTION_POSITIONS.with(|count| count.set(count.get() + rows));
         let n_embd = self.config.n_embd;
         let heads = self.config.n_head;
         let width = n_embd / heads;
@@ -1857,3 +1867,6 @@ mod tests {
 
 #[cfg(test)]
 mod feed_forward_scratch_tests;
+
+#[cfg(test)]
+mod prefix_final_row_tests;
