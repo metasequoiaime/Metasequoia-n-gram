@@ -249,6 +249,8 @@ struct Prefix<'a> {
     length: usize,
     keys: Cow<'a, [Vec<f32>]>,
     values: Cow<'a, [Vec<f32>]>,
+    /// 末位置续跑借用单行，直接在最终 KV 中拼接。
+    terminal: Option<&'a TerminalState>,
     /// 前缀末位置预测候选首字，隐藏状态与它的归一化常数一起共享。
     last_hidden: Arc<HiddenState>,
 }
@@ -283,7 +285,7 @@ struct TailRun {
 }
 
 impl TailRun {
-    /// 恢复前 taken 个 token 后的前缀；普通位置借用已有 KV，经过末位置才补算一次。
+    /// 恢复前 taken 个 token 后的前缀；已有 KV 和按需补算的末行都只借用。
     fn resume(&self, taken: usize, model: &SentenceModel) -> (Prefix<'_>, f32) {
         let n_embd = model.config.n_embd;
         debug_assert!(taken > 0 && taken <= self.cumulative.len());
@@ -293,6 +295,7 @@ impl TailRun {
                     self.base + self.hidden.len(),
                     &self.keys,
                     &self.values,
+                    None,
                     &[self.pending],
                 );
                 let width = (self.base + self.hidden.len()) * n_embd;
@@ -310,22 +313,12 @@ impl TailRun {
                     hidden: states.hidden.pop().expect("末位置已有前向结果"),
                 }
             });
-            let append = |prefix: &[Vec<f32>], last: &[Vec<f32>]| {
-                prefix
-                    .iter()
-                    .zip(last)
-                    .map(|(prefix, last)| {
-                        let mut row = prefix.clone();
-                        row.extend_from_slice(last);
-                        row
-                    })
-                    .collect()
-            };
             return (
                 Prefix {
                     length: self.base + taken,
-                    keys: Cow::Owned(append(&self.keys, &terminal.keys)),
-                    values: Cow::Owned(append(&self.values, &terminal.values)),
+                    keys: Cow::Borrowed(&self.keys),
+                    values: Cow::Borrowed(&self.values),
+                    terminal: Some(terminal),
                     last_hidden: terminal.hidden.clone(),
                 },
                 self.cumulative[taken - 1],
@@ -336,6 +329,7 @@ impl TailRun {
                 length: self.base + taken,
                 keys: Cow::Borrowed(&self.keys),
                 values: Cow::Borrowed(&self.values),
+                terminal: None,
                 last_hidden: self.hidden[taken - 1].clone(),
             },
             self.cumulative[taken - 1],
@@ -681,6 +675,7 @@ impl SentenceModel {
             length: tokens.len(),
             keys: Cow::Owned(keys),
             values: Cow::Owned(values),
+            terminal: None,
             last_hidden,
         }
     }
@@ -699,6 +694,7 @@ impl SentenceModel {
             prefix.length,
             &prefix.keys,
             &prefix.values,
+            prefix.terminal,
             &tail[..tail.len() - 1],
         );
         let mut running = self.log_probability(&prefix.last_hidden, tail[0]);
@@ -725,24 +721,32 @@ impl SentenceModel {
         length: usize,
         prefix_keys: &[Vec<f32>],
         prefix_values: &[Vec<f32>],
+        terminal: Option<&TerminalState>,
         tokens: &[u32],
     ) -> TailStates {
         // 借用的旧 KV 可能更长，只复制本次续跑可见的位置。
-        let prefix_width = length * self.config.n_embd;
+        let n_embd = self.config.n_embd;
+        let prefix_width = (length - usize::from(terminal.is_some())) * n_embd;
         if tokens.is_empty() {
+            let copy = |rows: &[Vec<f32>], last: Option<&[Vec<f32>]>| {
+                rows.iter()
+                    .enumerate()
+                    .map(|(layer, row)| {
+                        let mut out = Vec::with_capacity(length * n_embd);
+                        out.extend_from_slice(&row[..prefix_width]);
+                        if let Some(last) = last {
+                            out.extend_from_slice(&last[layer]);
+                        }
+                        out
+                    })
+                    .collect()
+            };
             return TailStates {
-                keys: prefix_keys
-                    .iter()
-                    .map(|row| row[..prefix_width].to_vec())
-                    .collect(),
-                values: prefix_values
-                    .iter()
-                    .map(|row| row[..prefix_width].to_vec())
-                    .collect(),
+                keys: copy(prefix_keys, terminal.map(|last| last.keys.as_slice())),
+                values: copy(prefix_values, terminal.map(|last| last.values.as_slice())),
                 hidden: Vec::new(),
             };
         }
-        let n_embd = self.config.n_embd;
         let mut x = self.embed(tokens, length);
         let mut feed_forward = FeedForwardScratch::default();
         let mut keys_out = Vec::with_capacity(self.blocks.len());
@@ -756,12 +760,13 @@ impl SentenceModel {
                 n_embd,
                 3 * n_embd,
             );
-            let (q, keys, values) = split_qkv(
+            let (q, keys, values) = split_qkv_with_suffix(
                 &qkv,
                 tokens.len(),
                 n_embd,
                 &prefix_keys[layer][..prefix_width],
                 &prefix_values[layer][..prefix_width],
+                terminal.map(|last| (last.keys[layer].as_slice(), last.values[layer].as_slice())),
             );
             let attended = self.attention(&q, &keys, &values, tokens.len(), length);
             let projected = linear(
@@ -1294,12 +1299,27 @@ fn split_qkv(
     prefix_keys: &[f32],
     prefix_values: &[f32],
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    split_qkv_with_suffix(qkv, rows, n_embd, prefix_keys, prefix_values, None)
+}
+
+/// 可选末行与旧前缀一起写入最终 K、V，不生成连续的临时前缀。
+fn split_qkv_with_suffix(
+    qkv: &[f32],
+    rows: usize,
+    n_embd: usize,
+    prefix_keys: &[f32],
+    prefix_values: &[f32],
+    suffix: Option<(&[f32], &[f32])>,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (last_keys, last_values) = suffix.unwrap_or((&[], &[]));
     let width = rows * n_embd;
     let mut q = Vec::with_capacity(width);
-    let mut k = Vec::with_capacity(prefix_keys.len() + width);
-    let mut v = Vec::with_capacity(prefix_values.len() + width);
+    let mut k = Vec::with_capacity(prefix_keys.len() + last_keys.len() + width);
+    let mut v = Vec::with_capacity(prefix_values.len() + last_values.len() + width);
     k.extend_from_slice(prefix_keys);
     v.extend_from_slice(prefix_values);
+    k.extend_from_slice(last_keys);
+    v.extend_from_slice(last_values);
     for row in 0..rows {
         let source = &qkv[row * 3 * n_embd..(row + 1) * 3 * n_embd];
         q.extend_from_slice(&source[..n_embd]);
@@ -1482,7 +1502,7 @@ mod tests {
     fn a_short_tail_does_not_double_the_retained_kv_capacity() {
         let model = cache_test_model();
         let prefix = model.run_prefix(&[super::BOS, 3, 4, 5, 6]);
-        let states = model.run_tail_states(5, &prefix.keys, &prefix.values, &[3]);
+        let states = model.run_tail_states(5, &prefix.keys, &prefix.values, None, &[3]);
         let width = 6 * model.config.n_embd;
         for row in states.keys.iter().chain(&states.values) {
             assert_eq!(row.len(), width);
@@ -1510,6 +1530,29 @@ mod tests {
     }
 
     #[test]
+    fn terminal_resume_borrows_the_existing_kv_storage() {
+        let model = cache_test_model();
+        let prefix = model.run_prefix(&model.prefix_tokens("我", 4));
+        for text in ["你", "你好我很"] {
+            let tokens = model.encode(text);
+            let run = model.run_tail(&prefix, &tokens);
+            let (resumed, _) = run.resume(tokens.len(), &model);
+            assert_eq!(
+                resumed.keys.as_ptr(),
+                run.keys.as_ptr(),
+                "末位置续跑复制了 KV 外层数组"
+            );
+            assert_eq!(resumed.values.as_ptr(), run.values.as_ptr());
+            for (left, right) in resumed.keys.iter().zip(&run.keys) {
+                assert_eq!(left.as_ptr(), right.as_ptr(), "末位置续跑复制了 key");
+            }
+            for (left, right) in resumed.values.iter().zip(&run.values) {
+                assert_eq!(left.as_ptr(), right.as_ptr(), "末位置续跑复制了 value");
+            }
+        }
+    }
+
+    #[test]
     fn borrowed_resume_matches_a_truncated_owned_prefix() {
         let model = cache_test_model();
         let prefix = model.run_prefix(&model.prefix_tokens("我", 4));
@@ -1520,20 +1563,34 @@ mod tests {
             let owned = super::Prefix {
                 length: resumed.length,
                 keys: std::borrow::Cow::Owned(
-                    resumed
-                        .keys
+                    run.keys
                         .iter()
-                        .map(|row| row[..width].to_vec())
+                        .enumerate()
+                        .map(|(layer, row)| {
+                            if taken > run.hidden.len() {
+                                [row.as_slice(), &run.terminal.get().unwrap().keys[layer]].concat()
+                            } else {
+                                row[..width].to_vec()
+                            }
+                        })
                         .collect(),
                 ),
                 values: std::borrow::Cow::Owned(
-                    resumed
-                        .values
+                    run.values
                         .iter()
-                        .map(|row| row[..width].to_vec())
+                        .enumerate()
+                        .map(|(layer, row)| {
+                            if taken > run.hidden.len() {
+                                [row.as_slice(), &run.terminal.get().unwrap().values[layer]]
+                                    .concat()
+                            } else {
+                                row[..width].to_vec()
+                            }
+                        })
                         .collect(),
                 ),
                 last_hidden: resumed.last_hidden.clone(),
+                terminal: None,
             };
             assert_eq!(carried.to_bits(), run.cumulative[taken - 1].to_bits());
             for text in ["吗", "吗你", "吗你好"] {
@@ -1870,3 +1927,6 @@ mod feed_forward_scratch_tests;
 
 #[cfg(test)]
 mod prefix_final_row_tests;
+
+#[cfg(test)]
+mod terminal_prefix_tests;

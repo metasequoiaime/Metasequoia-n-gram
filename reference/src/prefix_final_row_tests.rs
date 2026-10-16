@@ -44,6 +44,7 @@ fn baseline_prefix(model: &SentenceModel, tokens: &[u32]) -> Prefix<'static> {
         length: tokens.len(),
         keys: Cow::Owned(keys),
         values: Cow::Owned(values),
+        terminal: None,
         last_hidden,
     }
 }
@@ -59,7 +60,7 @@ fn prefix_computes_only_the_last_query_in_the_final_layer() {
     assert_eq!(prefix.values[0].len(), tokens.len() * model.config.n_embd);
 }
 
-fn model(width: usize, heads: usize, layers: usize, quantized: bool) -> SentenceModel {
+pub(super) fn model(width: usize, heads: usize, layers: usize, quantized: bool) -> SentenceModel {
     let matrix = |rows: usize, inputs: usize, salt: usize| Matrix {
         inner: if quantized {
             Tensor::Quantized {

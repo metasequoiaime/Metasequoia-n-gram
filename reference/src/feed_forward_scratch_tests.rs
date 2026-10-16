@@ -105,6 +105,7 @@ fn reference_run_prefix(model: &SentenceModel, tokens: &[u32]) -> Prefix<'static
         length: tokens.len(),
         keys: Cow::Owned(keys),
         values: Cow::Owned(values),
+        terminal: None,
         last_hidden,
     }
 }
@@ -320,7 +321,7 @@ fn real_model_forward_matches_legacy_bits() {
         for tail in ["", "甲", "甲乙丙", "甲乙丙丁戊己庚辛"] {
             let encoded = model.encode(tail);
             let a = reference_run_tail_states(&model, old.length, &old.keys, &old.values, &encoded);
-            let b = model.run_tail_states(new.length, &new.keys, &new.values, &encoded);
+            let b = model.run_tail_states(new.length, &new.keys, &new.values, None, &encoded);
             for (a, b) in a
                 .keys
                 .iter()
