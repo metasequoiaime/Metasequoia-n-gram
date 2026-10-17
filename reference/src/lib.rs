@@ -634,14 +634,8 @@ impl SentenceModel {
         let mut values = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
             self.normalize_attention_into(&x, block, &mut feed_forward);
-            let qkv = linear(
-                &feed_forward.normalized,
-                &block.qkv_weight,
-                &block.qkv_bias,
-                n_embd,
-                3 * n_embd,
-            );
-            let (q, k, v) = split_qkv(&qkv, tokens.len(), n_embd, &[], &[]);
+            self.qkv_into(block, &mut feed_forward);
+            let (q, k, v) = split_qkv(&feed_forward.hidden, tokens.len(), n_embd, &[], &[]);
             // 最后一层只消费末位置输出；所有位置的 KV 仍供后续候选使用。
             let first = if layer + 1 == self.blocks.len() {
                 tokens.len() - 1
@@ -750,15 +744,9 @@ impl SentenceModel {
         let mut values_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
             self.normalize_attention_into(&x, block, &mut feed_forward);
-            let qkv = linear(
-                &feed_forward.normalized,
-                &block.qkv_weight,
-                &block.qkv_bias,
-                n_embd,
-                3 * n_embd,
-            );
+            self.qkv_into(block, &mut feed_forward);
             let (q, keys, values) = split_qkv_with_suffix(
-                &qkv,
+                &feed_forward.hidden,
                 tokens.len(),
                 n_embd,
                 &prefix_keys[layer][..prefix_width],
@@ -819,6 +807,19 @@ impl SentenceModel {
             &block.ln1_bias,
             self.config.n_embd,
             &mut scratch.normalized,
+        );
+    }
+
+    fn qkv_into(&self, block: &Block, scratch: &mut FeedForwardScratch) {
+        let normalized = &scratch.normalized;
+        scratch.hidden.resize(normalized.len() * 3, 0.0);
+        linear_into(
+            normalized,
+            &block.qkv_weight,
+            &block.qkv_bias,
+            self.config.n_embd,
+            3 * self.config.n_embd,
+            &mut scratch.hidden,
         );
     }
 
@@ -1252,6 +1253,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// `out[m][o] = dot(x[m], w[o]) + bias[o]`, with both operands laid out row-major so every dot
 /// product runs over contiguous memory.
+#[cfg(test)]
 fn linear(x: &[f32], w: &Matrix, bias: &[f32], inputs: usize, outputs: usize) -> Vec<f32> {
     let mut out = vec![0.0; x.len() / inputs * outputs];
     linear_into(x, w, bias, inputs, outputs, &mut out);
