@@ -318,6 +318,41 @@ fn geometry_that_disagrees_with_the_configuration_is_rejected() {
 }
 
 #[test]
+fn quantized_row_counts_must_match_runtime_geometry() {
+    for name in [
+        "tok.weight",
+        "blocks.0.qkv.weight",
+        "blocks.0.proj.weight",
+        "blocks.0.fc.weight",
+        "blocks.0.out.weight",
+    ] {
+        for extra_rows in [false, true] {
+            let mut builder = complete("int8");
+            let (_, shape, tensor) = builder
+                .entries
+                .iter_mut()
+                .find(|(tensor_name, ..)| tensor_name == name)
+                .expect("matrix");
+            // 保持元素总数不变，让文件形状和 scale 彼此一致，但与运行时行数不符。
+            if extra_rows {
+                shape[0] *= 2;
+                shape[1] /= 2;
+            } else {
+                shape[0] /= 2;
+                shape[1] *= 2;
+            }
+            let Tensor::I8(_, scales) = tensor else {
+                panic!("expected quantized matrix");
+            };
+            scales.resize(shape[0], 1.0);
+            let error = SentenceModel::load(&builder.finish())
+                .expect_err("accepted incompatible quantized row count");
+            assert!(matches!(error, ModelError::Geometry(_)), "{name}: {error}");
+        }
+    }
+}
+
+#[test]
 fn a_missing_tensor_names_itself() {
     let mut builder = complete("f32");
     builder
@@ -448,6 +483,50 @@ fn resumed_scores_match_scoring_from_nothing() {
                 (left - right).abs() < 1e-4,
                 "{precision} candidate {index}: resumed {left}, fresh {right}"
             );
+        }
+    }
+}
+
+/// 完全复用、部分续跑与上下文失效都必须保留冷计算的评分与首选。
+#[test]
+fn cached_sequences_match_fresh_scores() {
+    for precision in ["f32", "f16", "int8"] {
+        let model =
+            std::sync::Arc::new(SentenceModel::load(&complete(precision).finish()).unwrap());
+        let mut reranker = Reranker::new(model.clone());
+        let rounds: &[(&str, &[&str])] = &[
+            ("我", &["你好", "你吗"]),
+            ("我", &["你吗", "你好", "你好"]),
+            ("我", &["你好吗", "你很", "你"]),
+            ("我", &["你", "你好吗", "我很好", ""]),
+            ("很", &["你", "你好吗", "我很好", ""]),
+            ("我很好我很好我很好", &["你好", "你吗"]),
+            ("吗我很好我很好我很好", &["你吗", "你好"]),
+            ("", &["你好你好你好你好我", "你好你好你好你好吗"]),
+            ("", &["你好你好你好你好吗", "你好你好你好你好我"]),
+            ("", &["", ""]),
+            ("", &[]),
+            ("", &["你好", "你吗", "🙂", "A"]),
+        ];
+        for &(context, texts) in rounds {
+            let warm = reranker.log_probabilities(context, texts);
+            let fresh = Reranker::new(model.clone()).log_probabilities(context, texts);
+            for (left, right) in warm.iter().zip(&fresh) {
+                assert!(
+                    left == right || (left - right).abs() < 1e-4,
+                    "{precision}: warm {left}, fresh {right}"
+                );
+            }
+            let best = |scores: &[f32]| {
+                scores
+                    .iter()
+                    .enumerate()
+                    .fold(None, |best: Option<usize>, (index, score)| match best {
+                        Some(old) if *score <= scores[old] => Some(old),
+                        _ => Some(index),
+                    })
+            };
+            assert_eq!(best(&warm), best(&fresh), "{precision}");
         }
     }
 }
