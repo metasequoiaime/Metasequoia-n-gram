@@ -316,6 +316,28 @@ fn attention_layer_norm_reuses_normalized_buffer() {
 }
 
 #[test]
+fn qkv_projection_reuses_hidden_buffer() {
+    let mut model = model(8, 3, true);
+    model.blocks[0].qkv_weight = matrix(24, 8, true, 17);
+    model.blocks[0].qkv_bias = vec![0.0; 24];
+    let normalized = input(8, 4);
+    let mut scratch = FeedForwardScratch::default();
+    scratch.hidden.resize(normalized.len() * 3, 0.0);
+    let pointer = scratch.hidden.as_ptr();
+    scratch.normalized.clone_from(&normalized);
+    model.qkv_into(&model.blocks[0], &mut scratch);
+    let expected = reference_linear(
+        &normalized,
+        &model.blocks[0].qkv_weight,
+        &model.blocks[0].qkv_bias,
+        8,
+        24,
+    );
+    assert_eq!(bits(&scratch.hidden[..expected.len()]), bits(&expected));
+    assert_eq!(pointer, scratch.hidden.as_ptr());
+}
+
+#[test]
 fn complete_feed_forward_matches_legacy_bits() {
     for quantized in [false, true] {
         for width in [1, 7, 8, 9, 192, 768] {
@@ -426,6 +448,99 @@ fn new_layer_norm_chain(model: &SentenceModel, x: &[f32]) -> Vec<f32> {
 }
 
 type LayerNormChain = fn(&SentenceModel, &[f32]) -> Vec<f32>;
+
+#[inline(never)]
+fn old_qkv_chain(model: &SentenceModel, x: &[f32]) -> Vec<f32> {
+    let mut output = Vec::new();
+    for block in &model.blocks {
+        output = reference_linear(
+            x,
+            &block.qkv_weight,
+            &block.qkv_bias,
+            model.config.n_embd,
+            3 * model.config.n_embd,
+        );
+        black_box(&output);
+    }
+    output
+}
+
+#[inline(never)]
+fn new_qkv_chain(model: &SentenceModel, x: &[f32]) -> Vec<f32> {
+    let mut scratch = FeedForwardScratch {
+        normalized: x.to_vec(),
+        hidden: Vec::new(),
+    };
+    for block in &model.blocks {
+        model.qkv_into(block, &mut scratch);
+        black_box(&scratch.hidden);
+    }
+    scratch.hidden
+}
+
+type QkvChain = fn(&SentenceModel, &[f32]) -> Vec<f32>;
+
+fn elapsed_qkv(chain: QkvChain, model: &SentenceModel, x: &[f32], repeats: usize) -> f64 {
+    let start = Instant::now();
+    for _ in 0..repeats {
+        drop(black_box(chain(black_box(model), black_box(x))));
+    }
+    start.elapsed().as_secs_f64()
+}
+
+#[test]
+#[ignore = "独占运行六层 QKV 配对预算"]
+fn six_layer_qkv_paired_budget() {
+    let mut failures = Vec::new();
+    for quantized in [true, false] {
+        for width in [192, 768] {
+            let mut model = model(width, 6, quantized);
+            for (layer, block) in model.blocks.iter_mut().enumerate() {
+                block.qkv_weight = matrix(3 * width, width, quantized, layer);
+                block.qkv_bias = vec![0.0; 3 * width];
+            }
+            for rows in [1, 4, 12] {
+                let x = input(width, rows);
+                assert_eq!(
+                    bits(&old_qkv_chain(&model, &x)),
+                    bits(&new_qkv_chain(&model, &x))
+                );
+                let mut repeats = 1;
+                while elapsed_qkv(old_qkv_chain, &model, &x, repeats) < 0.010 {
+                    repeats *= 2;
+                }
+                let mut ratios = Vec::new();
+                for pair in 0..40 {
+                    let (old, new) = if pair % 2 == 0 {
+                        let old = elapsed_qkv(old_qkv_chain, &model, &x, repeats);
+                        (old, elapsed_qkv(new_qkv_chain, &model, &x, repeats))
+                    } else {
+                        let new = elapsed_qkv(new_qkv_chain, &model, &x, repeats);
+                        (elapsed_qkv(old_qkv_chain, &model, &x, repeats), new)
+                    };
+                    ratios.push(new / old);
+                }
+                ratios.sort_by(f64::total_cmp);
+                let ratio = ratios[19];
+                let budget = if quantized && width == 192 && rows == 1 {
+                    0.99
+                } else {
+                    1.03
+                };
+                println!(
+                    "quantized={quantized} width={width} rows={rows} repeats={repeats} paired_ratio_p50={ratio:.4} budget={budget:.2}"
+                );
+                if ratio >= budget {
+                    failures.push((quantized, width, rows, ratio, budget));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "paired QKV budget failures: {failures:?}"
+    );
+}
 
 fn elapsed_layer_norm(
     chain: LayerNormChain,
