@@ -635,7 +635,15 @@ impl SentenceModel {
         for (layer, block) in self.blocks.iter().enumerate() {
             self.normalize_attention_into(&x, block, &mut feed_forward);
             self.qkv_into(block, &mut feed_forward);
-            let (q, k, v) = split_qkv(&feed_forward.hidden, tokens.len(), n_embd, &[], &[]);
+            let (k, v) = split_qkv_with_suffix_into(
+                &feed_forward.hidden,
+                tokens.len(),
+                n_embd,
+                &[],
+                &[],
+                None,
+                &mut feed_forward.normalized,
+            );
             // 最后一层只消费末位置输出；所有位置的 KV 仍供后续候选使用。
             let first = if layer + 1 == self.blocks.len() {
                 tokens.len() - 1
@@ -643,7 +651,13 @@ impl SentenceModel {
                 0
             };
             let start = first * n_embd;
-            let attended = self.attention(&q[start..], &k, &v, tokens.len() - first, first);
+            let attended = self.attention(
+                &feed_forward.normalized[start..],
+                &k,
+                &v,
+                tokens.len() - first,
+                first,
+            );
             self.project_attention_into(&attended, block, &mut feed_forward);
             for (slot, &value) in x[start..].iter_mut().zip(&feed_forward.normalized) {
                 *slot += value;
@@ -745,15 +759,22 @@ impl SentenceModel {
         for (layer, block) in self.blocks.iter().enumerate() {
             self.normalize_attention_into(&x, block, &mut feed_forward);
             self.qkv_into(block, &mut feed_forward);
-            let (q, keys, values) = split_qkv_with_suffix(
+            let (keys, values) = split_qkv_with_suffix_into(
                 &feed_forward.hidden,
                 tokens.len(),
                 n_embd,
                 &prefix_keys[layer][..prefix_width],
                 &prefix_values[layer][..prefix_width],
                 terminal.map(|last| (last.keys[layer].as_slice(), last.values[layer].as_slice())),
+                &mut feed_forward.normalized,
             );
-            let attended = self.attention(&q, &keys, &values, tokens.len(), length);
+            let attended = self.attention(
+                &feed_forward.normalized,
+                &keys,
+                &values,
+                tokens.len(),
+                length,
+            );
             self.project_attention_into(&attended, block, &mut feed_forward);
             for (slot, &value) in x.iter_mut().zip(&feed_forward.normalized) {
                 *slot += value;
@@ -1322,6 +1343,7 @@ fn layer_norm_into(x: &[f32], weight: &[f32], bias: &[f32], width: usize, out: &
 }
 
 /// 按最终大小拆分，新增 K、V 直接写入已有可见前缀之后。
+#[cfg(test)]
 fn split_qkv(
     qkv: &[f32],
     rows: usize,
@@ -1333,6 +1355,7 @@ fn split_qkv(
 }
 
 /// 可选末行与旧前缀一起写入最终 K、V，不生成连续的临时前缀。
+#[cfg(test)]
 fn split_qkv_with_suffix(
     qkv: &[f32],
     rows: usize,
@@ -1341,9 +1364,33 @@ fn split_qkv_with_suffix(
     prefix_values: &[f32],
     suffix: Option<(&[f32], &[f32])>,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut query = Vec::with_capacity(rows * n_embd);
+    let (keys, values) = split_qkv_with_suffix_into(
+        qkv,
+        rows,
+        n_embd,
+        prefix_keys,
+        prefix_values,
+        suffix,
+        &mut query,
+    );
+    (query, keys, values)
+}
+
+/// 把 query 写入调用者提供的 scratch，并按既有顺序返回最终 K、V。
+fn split_qkv_with_suffix_into(
+    qkv: &[f32],
+    rows: usize,
+    n_embd: usize,
+    prefix_keys: &[f32],
+    prefix_values: &[f32],
+    suffix: Option<(&[f32], &[f32])>,
+    query: &mut Vec<f32>,
+) -> (Vec<f32>, Vec<f32>) {
     let (last_keys, last_values) = suffix.unwrap_or((&[], &[]));
     let width = rows * n_embd;
-    let mut q = Vec::with_capacity(width);
+    query.clear();
+    query.reserve(width);
     let mut k = Vec::with_capacity(prefix_keys.len() + last_keys.len() + width);
     let mut v = Vec::with_capacity(prefix_values.len() + last_values.len() + width);
     k.extend_from_slice(prefix_keys);
@@ -1352,11 +1399,11 @@ fn split_qkv_with_suffix(
     v.extend_from_slice(last_values);
     for row in 0..rows {
         let source = &qkv[row * 3 * n_embd..(row + 1) * 3 * n_embd];
-        q.extend_from_slice(&source[..n_embd]);
+        query.extend_from_slice(&source[..n_embd]);
         k.extend_from_slice(&source[n_embd..2 * n_embd]);
         v.extend_from_slice(&source[2 * n_embd..]);
     }
-    (q, k, v)
+    (k, v)
 }
 
 /// The exact GELU, matching `torch.nn.functional.gelu` with its default settings. The tanh

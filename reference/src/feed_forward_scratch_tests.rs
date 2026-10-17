@@ -338,6 +338,41 @@ fn qkv_projection_reuses_hidden_buffer() {
 }
 
 #[test]
+fn query_split_reuses_normalized_buffer() {
+    let qkv = [
+        1.0, -0.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+    ];
+    let prefix_keys = [21.0, 22.0];
+    let prefix_values = [31.0, 32.0];
+    let suffix_keys = [41.0, 42.0];
+    let suffix_values = [51.0, 52.0];
+    let expected = split_qkv_with_suffix(
+        &qkv,
+        2,
+        2,
+        &prefix_keys,
+        &prefix_values,
+        Some((&suffix_keys, &suffix_values)),
+    );
+    let mut scratch = FeedForwardScratch::default();
+    scratch.normalized.resize(4, 0.0);
+    let pointer = scratch.normalized.as_ptr();
+    let (keys, values) = split_qkv_with_suffix_into(
+        &qkv,
+        2,
+        2,
+        &prefix_keys,
+        &prefix_values,
+        Some((&suffix_keys, &suffix_values)),
+        &mut scratch.normalized,
+    );
+    assert_eq!(bits(&scratch.normalized), bits(&expected.0));
+    assert_eq!(bits(&keys), bits(&expected.1));
+    assert_eq!(bits(&values), bits(&expected.2));
+    assert_eq!(pointer, scratch.normalized.as_ptr());
+}
+
+#[test]
 fn complete_feed_forward_matches_legacy_bits() {
     for quantized in [false, true] {
         for width in [1, 7, 8, 9, 192, 768] {
@@ -539,6 +574,105 @@ fn six_layer_qkv_paired_budget() {
     assert!(
         failures.is_empty(),
         "paired QKV budget failures: {failures:?}"
+    );
+}
+
+#[inline(never)]
+fn old_query_split_chain(qkv: &[f32], rows: usize, width: usize) -> Vec<f32> {
+    let mut query = Vec::new();
+    for _ in 0..6 {
+        let (current, keys, values) = split_qkv(qkv, rows, width, &[], &[]);
+        black_box((&keys, &values));
+        query = current;
+    }
+    query
+}
+
+#[inline(never)]
+fn new_query_split_chain(qkv: &[f32], rows: usize, width: usize) -> Vec<f32> {
+    let mut query = Vec::new();
+    for _ in 0..6 {
+        let (keys, values) =
+            split_qkv_with_suffix_into(qkv, rows, width, &[], &[], None, &mut query);
+        black_box((&keys, &values));
+    }
+    query
+}
+
+type QuerySplitChain = fn(&[f32], usize, usize) -> Vec<f32>;
+
+fn elapsed_query_split(
+    chain: QuerySplitChain,
+    qkv: &[f32],
+    rows: usize,
+    width: usize,
+    repeats: usize,
+) -> f64 {
+    let start = Instant::now();
+    for _ in 0..repeats {
+        drop(black_box(chain(black_box(qkv), rows, width)));
+    }
+    start.elapsed().as_secs_f64()
+}
+
+#[test]
+#[ignore = "独占运行六层 query 拆分配对预算"]
+fn six_layer_query_split_paired_budget() {
+    let mut failures = Vec::new();
+    for quantized in [true, false] {
+        for width in [192, 768] {
+            for rows in [1, 4, 12] {
+                let mut qkv = input(width * 3, rows);
+                if quantized {
+                    qkv[0] = -qkv[0];
+                }
+                assert_eq!(
+                    bits(&old_query_split_chain(&qkv, rows, width)),
+                    bits(&new_query_split_chain(&qkv, rows, width))
+                );
+                let mut repeats = 1;
+                while elapsed_query_split(old_query_split_chain, &qkv, rows, width, repeats) < 0.010
+                {
+                    repeats *= 2;
+                }
+                let mut ratios = Vec::new();
+                for pair in 0..40 {
+                    let (old, new) = if pair % 2 == 0 {
+                        let old =
+                            elapsed_query_split(old_query_split_chain, &qkv, rows, width, repeats);
+                        (
+                            old,
+                            elapsed_query_split(new_query_split_chain, &qkv, rows, width, repeats),
+                        )
+                    } else {
+                        let new =
+                            elapsed_query_split(new_query_split_chain, &qkv, rows, width, repeats);
+                        (
+                            elapsed_query_split(old_query_split_chain, &qkv, rows, width, repeats),
+                            new,
+                        )
+                    };
+                    ratios.push(new / old);
+                }
+                ratios.sort_by(f64::total_cmp);
+                let ratio = ratios[19];
+                let budget = if quantized && width == 192 && rows == 1 {
+                    0.99
+                } else {
+                    1.03
+                };
+                println!(
+                    "quantized={quantized} width={width} rows={rows} repeats={repeats} paired_ratio_p50={ratio:.4} budget={budget:.2}"
+                );
+                if ratio >= budget {
+                    failures.push((quantized, width, rows, ratio, budget));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "paired query split budget failures: {failures:?}"
     );
 }
 
